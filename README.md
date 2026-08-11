@@ -177,6 +177,12 @@ manually: `git -C targets/pyyaml checkout -- .`
 
 ## Next steps
 
+**[`Plan.md`](Plan.md) — the next major piece of work: a stateless MCP toolserver** that
+lets the triage model *pull* context (source, code search, log queries, git line history)
+instead of receiving a fixed packet we chose for it. Fully planned, not yet implemented.
+
+Smaller items:
+
 1. **Grade `proposed_fix` too.** Highest value — it's the axis where the pipeline
    currently fails silently. Add a second field to `JudgeScore`.
 2. **Persist verdicts** to `verdicts.csv` (~6 lines with `csv.writer`), so prompt and
