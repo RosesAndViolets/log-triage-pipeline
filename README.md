@@ -123,6 +123,56 @@ Cost: one agentic triage is up to 6 requests against a 20/day cap. The tools the
 are plain functions in `mcp_tools.py` — `python mcp_tools.py` exercises all four, plus
 the path jail, with no server and no API key.
 
+## Broken vs reported: the noise experiment
+
+In production the number of flaws in the code and the number that produced logs are not
+the same number. If a hundred bugs exist and ten get reported, a model reading source
+meets the other ninety — each a plausible culprit next to the real one.
+
+`realapp.py` separates the two:
+
+```bash
+python realapp.py --agentic --logged 1 --injected 9 --seed 1
+#                            │           │            └ same seed, same run, every time
+#                            │           └ bugs present on disk while the model reads
+#                            └ bugs actually exercised, which produced the error logs
+```
+
+- **`--logged Y`** — max 3, since only those three carry ground truth.
+- **`--injected X`** — max 9: the 3 real faults plus 6 `DISTRACTORS`, one-line PyYAML bugs
+  that are never run and have no right answer attached. Two live in `constructor.py`, so a
+  decoy sits in the same file as the real boolean fault.
+- **`X = 0`** is the pristine control: the errors were reported, but the code is clean by
+  triage time. Can it diagnose what it cannot see?
+- Default is `X = Y = 3`, unchanged from before.
+
+Every run prints its condition, so a screenshot is self-describing:
+
+```
+condition: 1 logged / 9 injected / seed 1   (8 unreported bugs in the code)
+```
+
+This is safe because nothing executes after `exercise()` — the triage phase only reads
+files. A distractor cannot break a run the way the scanner fault broke parsing; it can
+only mislead a reader, which is the point.
+
+### First observation, and why it is not yet a result
+
+Same constructor fault, agentic, `gemini-3.1-flash-lite`:
+
+| Condition | Root cause | Proposed fix | Judge |
+|---|---|---|---|
+| `--injected 1` | case mismatch — correct | revert line 238 to `.lower()` — correct | 1.00 |
+| `--injected 9` | case mismatch — correct | add `'TRUE'`/`'FALSE'` to `bool_values` — **patches around the bug** | 1.00 |
+
+The diagnosis survived eight decoys. The *remedy* did not: under noise it treated the
+injected `.upper()` as intended and proposed changing the dictionary to match it. Both
+scored 1.00, because the judge never reads `proposed_fix`.
+
+**One run per condition, and the model is nondeterministic — this is a hypothesis, not a
+finding.** Repeat across seeds before claiming the decoys caused it. That is what `--seed`
+is for.
+
 ## Architecture
 
 **Logs are produced by real failures.** Neither simulator writes log strings by hand.

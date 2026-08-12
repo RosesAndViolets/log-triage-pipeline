@@ -12,6 +12,7 @@ Run:
 """
 
 import logging
+import random
 import re
 import subprocess
 import sys
@@ -73,6 +74,48 @@ FAULTS = [
 ]
 
 
+# Bugs that are never exercised and never logged — the ninety flaws nobody filed a
+# ticket for. They exist only to be found by a model reading the code, so they carry no
+# `true_cause`: there is no right answer that names one of these.
+#
+# Safe because nothing executes after exercise(); the triage phase only reads files.
+# A distractor cannot break a run the way the scanner fault did — it can only mislead.
+# Two are in constructor.py on purpose: the adversarial case is a decoy the model trips
+# over while reading the correct file.
+DISTRACTORS = [
+    {"service": "-", "file": "lib/yaml/reader.py",
+     "old": "self.column += 1", "new": "self.column += 2"},
+    {"service": "-", "file": "lib/yaml/reader.py",
+     "old": "self.line += 1", "new": "self.line -= 1"},
+    {"service": "-", "file": "lib/yaml/scanner.py",
+     "old": "return self.tokens.pop(0)", "new": "return self.tokens.pop()"},
+    {"service": "-", "file": "lib/yaml/scanner.py",
+     "old": "if ch == '|' and not self.flow_level:", "new": "if ch == '|' and self.flow_level:"},
+    {"service": "-", "file": "lib/yaml/constructor.py",
+     "old": "return sign*int(value[2:], 16)", "new": "return sign*int(value[2:], 8)"},
+    {"service": "-", "file": "lib/yaml/constructor.py",
+     "old": "return sign*int(value, 8)", "new": "return sign*int(value, 10)"},
+]
+
+
+def select(logged: int, injected: int, seed: int) -> tuple[list[dict], list[dict]]:
+    """Choose which faults are reported (Y) and which are merely present (X).
+
+    A fault that produced a log is by definition in the code, so the logged set is
+    always a subset of the injected set. Remaining slots are filled with real faults
+    that stayed silent first, then distractors — silent real bugs are the better
+    decoys, because they are the same kind of thing as the answer.
+    """
+    rng = random.Random(seed)
+    pool = list(FAULTS)
+    rng.shuffle(pool)
+    chosen = pool[:logged]
+    rest = pool[logged:] + [d for d in DISTRACTORS]
+    rng.shuffle(rest)
+    on_disk = chosen + rest[: max(0, injected - len(chosen))]
+    return chosen, on_disk[:injected]
+
+
 def apply(fault: dict):
     p = TARGET / fault["file"]
     src = p.read_text()
@@ -130,14 +173,14 @@ class SourcePipeline(EvalPipeline):
         return f"{source}\n\nlog trail:\n{trail}" if source else trail
 
 
-def exercise(pipeline, times: int = 3):
+def exercise(pipeline, times: int = 3, faults: list[dict] | None = None):
     """Run the broken library for real and log whatever it raises.
 
     One fault at a time, reverted before the next: a global fault like the scanner
     injection breaks parsing outright and masks every fault downstream of it.
     """
     handler = PipelineHandler(pipeline)
-    for f in FAULTS:
+    for f in faults if faults is not None else FAULTS:
         apply(f)
         try:
             yaml = fresh_yaml()
@@ -161,7 +204,37 @@ def exercise(pipeline, times: int = 3):
             revert()
 
 
+def _args() -> tuple[int, int, int]:
+    """--logged Y, --injected X, --seed N. Defaults reproduce the previous behaviour."""
+    def opt(name, default):
+        return int(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
+
+    logged = opt("--logged", len(FAULTS))
+    injected = opt("--injected", logged)
+    if logged > len(FAULTS):
+        raise SystemExit(f"--logged max is {len(FAULTS)}: only these carry ground truth")
+    if injected > len(FAULTS) + len(DISTRACTORS):
+        raise SystemExit(f"--injected max is {len(FAULTS) + len(DISTRACTORS)}")
+    if injected and injected < logged:
+        raise SystemExit("--injected cannot be below --logged: a bug that logged is in the code")
+    return logged, injected, opt("--seed", 0)
+
+
 def _self_check():
+    # Distractors rot like the real injection points do — fail loudly, not silently.
+    for d in DISTRACTORS:
+        src = (TARGET / d["file"]).read_text()
+        assert src.count(d["old"]) == 1, f"distractor site not unique: {d['file']} {d['old']!r}"
+
+    # Selection: logged is always a subset of injected, and seeds are reproducible.
+    a_chosen, a_disk = select(1, 9, seed=7)
+    b_chosen, b_disk = select(1, 9, seed=7)
+    assert [f["service"] for f in a_chosen] == [f["service"] for f in b_chosen], "seed not stable"
+    assert len(a_disk) == 9 and all(c in a_disk for c in a_chosen), "logged not inside injected"
+    seeds = {select(1, 3, s)[0][0]["service"] for s in range(12)}
+    assert len(seeds) > 1, f"seed changes nothing: {seeds}"
+    assert select(1, 0, 0)[1] == [], "--injected 0 must leave the clone pristine"
+
     mockapp.reset()
     p = SourcePipeline(threshold=3)
     exercise(p)
@@ -194,20 +267,26 @@ if __name__ == "__main__":
     try:
         _self_check()
 
+        logged, injected, seed = _args()
+        chosen, on_disk = select(logged, injected, seed)
+
         mockapp.reset()
         pipeline = SourcePipeline(threshold=3)
-        exercise(pipeline)
-        print(f"\nexercised {len(FAULTS)} injected faults in {TARGET.name}, "
-              f"{len(BUFFER)} log records")
+        exercise(pipeline, faults=chosen)
 
-        # Put every injection back for the triage session. exercise() reverts each
-        # fault as it goes, so by now the files on disk are pristine — and read_source
-        # reads live disk, unlike the push-mode snapshot taken at log time. Without
-        # this the model would be handed correct code and asked why it crashed.
-        # Nothing is executed from here on, so the masking that forced isolation
-        # during exercise() cannot bite.
-        for f in FAULTS:
+        # Put the injections back for the triage session. exercise() reverts each fault
+        # as it goes, so by now the files are pristine — and read_source reads live disk,
+        # unlike the push-mode snapshot taken at log time. Without this the model would
+        # be handed correct code and asked why it crashed. Nothing executes from here on,
+        # so the masking that forced isolation during exercise() cannot bite.
+        for f in on_disk:
             apply(f)
+
+        silent = len(on_disk) - len(chosen)
+        print(f"\ncondition: {len(chosen)} logged / {len(on_disk)} injected / seed {seed}"
+              f"   ({silent} unreported bug{'s' if silent != 1 else ''} in the code)")
+        print(f"reported:  {', '.join(f['service'] for f in chosen) or 'none'}")
+        print(f"{len(BUFFER)} log records from {TARGET.name}")
         pipeline.run(interactive=True, agentic="--agentic" in sys.argv)
     finally:
         revert()  # ponytail: leaves the clone clean even on Ctrl-C
