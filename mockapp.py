@@ -10,6 +10,7 @@ Run:  python mockapp.py
 import itertools
 import json
 import logging
+import sys
 import urllib.request
 from collections import deque
 from typing import Callable
@@ -17,6 +18,7 @@ from typing import Callable
 from google.genai import errors, types
 from pydantic import BaseModel, Field
 
+import mcp_tools
 import triage
 
 BUFFER = deque(maxlen=2000)  # every record, not just errors — INFO lines are the evidence
@@ -27,6 +29,17 @@ _trace_seq = itertools.count(1)
 
 def new_trace() -> str:
     return f"{next(_trace_seq):06x}"
+
+
+def reset():
+    """Start a run clean — in-memory buffers and the on-disk log store both.
+
+    Without truncating the store, get_logs would serve the previous run's lines
+    and the model would reason about an error that is no longer there.
+    """
+    BUFFER.clear()
+    TRUTH.clear()
+    mcp_tools.LOG_STORE.write_text("")
 
 
 class JudgeScore(BaseModel):
@@ -151,6 +164,9 @@ class PipelineHandler(logging.Handler):
             "error": {"class": cls, "stack": self.format(record) if record.exc_info else ""},
         }
         BUFFER.append(entry)
+        # Also to disk: the MCP server is a separate process and cannot read BUFFER.
+        with open(mcp_tools.LOG_STORE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
         self.pipeline.ingest([entry])  # ingest() already drops non-ERROR levels
 
 
@@ -253,8 +269,7 @@ def simulate(pipeline: triage.TriagePipeline):
 
 
 def _self_check():
-    BUFFER.clear()
-    TRUTH.clear()
+    reset()
     p = EvalPipeline(threshold=3)
     simulate(p)
 
@@ -285,14 +300,13 @@ def _self_check():
 if __name__ == "__main__":
     _self_check()
 
-    BUFFER.clear()
-    TRUTH.clear()
+    reset()
     EvalPipeline.scores = []
     pipeline = EvalPipeline(threshold=3)
     simulate(pipeline)
     print(f"\nsimulated {len(BUFFER)} log records across "
           f"{len({e['serviceName'] for e in BUFFER})} services")
-    pipeline.run(interactive=True)
+    pipeline.run(interactive=True, agentic="--agentic" in sys.argv)
 
     if pipeline.scores:
         n = len(pipeline.scores)

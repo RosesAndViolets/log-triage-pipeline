@@ -1,14 +1,19 @@
 # Stateless MCP toolserver for the triage pipeline
 
-> **Status: planned, not implemented.** Written 2026-08-11. No code from this document
-> exists yet — `mcp_tools.py` and `mcp_server.py` have not been created, and `triage.py`
-> has no agentic path. The probe findings below are verified against the live API; the
-> code blocks are design sketches, not copies of working files.
+> **Status: IMPLEMENTED 2026-08-12.** `mcp_tools.py`, `mcp_server.py` and
+> `triage.triage_agentic()` exist and are verified live. Run it with
+> `python realapp.py --agentic`. See the README's *Pulling context through MCP*
+> section for how it behaves; the sketches below are kept as the design record and
+> differ from the shipped code in three places found during implementation:
 >
-> Design decisions already settled: verdict returns via a `submit_verdict` tool (not
-> `response_schema`), tool loop capped at `maximum_remote_calls=4`.
->
-> Start at **Files** for the work breakdown, **Verification** for how to prove it works.
+> - `mcp` must be pinned **<2** — google-genai 2.17 reads `tool.inputSchema`, which
+>   mcp 2.0 renamed to `input_schema`. The server uses `FastMCP`, not `MCPServer`.
+> - The config must be passed as a **dict**, not a `GenerateContentConfig` — the object
+>   branch runs `model_copy(deep=True)` and a live `ClientSession` holds an
+>   `_asyncio.Task`, which cannot be pickled.
+> - `maximum_remote_calls` is `budget + 1`: `submit_verdict` is itself a function call,
+>   and without the extra slot the model spends the whole budget investigating and is
+>   cut off before it can answer. Observed on the first live run.
 
 ## Context
 

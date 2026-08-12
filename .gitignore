@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .vscode/
 .DS_Store
+
+# Log store — written per run, read by the MCP get_logs tool.
+run.jsonl

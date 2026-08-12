@@ -17,6 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import mockapp
 import triage
 from mockapp import BUFFER, TRUTH, EvalPipeline, PipelineHandler, new_trace
 
@@ -161,8 +162,7 @@ def exercise(pipeline, times: int = 3):
 
 
 def _self_check():
-    BUFFER.clear()
-    TRUTH.clear()
+    mockapp.reset()
     p = SourcePipeline(threshold=3)
     exercise(p)
 
@@ -194,13 +194,21 @@ if __name__ == "__main__":
     try:
         _self_check()
 
-        BUFFER.clear()
-        TRUTH.clear()
+        mockapp.reset()
         pipeline = SourcePipeline(threshold=3)
         exercise(pipeline)
         print(f"\nexercised {len(FAULTS)} injected faults in {TARGET.name}, "
               f"{len(BUFFER)} log records")
-        pipeline.run(interactive=True)
+
+        # Put every injection back for the triage session. exercise() reverts each
+        # fault as it goes, so by now the files on disk are pristine — and read_source
+        # reads live disk, unlike the push-mode snapshot taken at log time. Without
+        # this the model would be handed correct code and asked why it crashed.
+        # Nothing is executed from here on, so the masking that forced isolation
+        # during exercise() cannot bite.
+        for f in FAULTS:
+            apply(f)
+        pipeline.run(interactive=True, agentic="--agentic" in sys.argv)
     finally:
         revert()  # ponytail: leaves the clone clean even on Ctrl-C
         print("clone reverted to pristine.")

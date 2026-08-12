@@ -1,10 +1,13 @@
 """Automated log triage pipeline: dedup -> normalize -> Gemini triage -> mock Slack."""
 
+import asyncio
 import hashlib
 import os
 import re
+import sys
 import time
 from collections import Counter
+from pathlib import Path
 
 from google import genai
 from google.genai import errors, types
@@ -14,6 +17,8 @@ from pydantic import BaseModel, Field, model_validator
 # Override for a stronger verdict: TRIAGE_MODEL=gemini-3.6-flash python mockapp.py
 MODEL = os.getenv("TRIAGE_MODEL", "gemini-3.1-flash-lite")
 RPM_SLEEP = 4  # base pacing for the free tier; the client's retry_options absorb the rest
+# Each tool round-trip is its own API request, so this is a budget, not a timeout.
+AGENTIC_TOOL_BUDGET = int(os.getenv("TRIAGE_TOOL_BUDGET", "4"))
 
 
 class TriageVerdict(BaseModel):
@@ -51,6 +56,7 @@ def fingerprint(log: dict) -> str:
 class TriagePipeline:
     def __init__(self, threshold: int = 3):
         self.threshold = threshold
+        self.agentic = False
         self.counts: Counter[str] = Counter()
         self.samples: dict[str, dict] = {}
         # The SDK retries 429/503 with exponential backoff itself — no hand-rolled retry loop.
@@ -75,8 +81,9 @@ class TriagePipeline:
             self.counts[fp] += 1
             self.samples.setdefault(fp, log)
 
-    def run(self, interactive: bool = False):
+    def run(self, interactive: bool = False, agentic: bool = False):
         """Stage 3 & 4: LLM triage loop, then routing."""
+        self.agentic = agentic
         hot = [fp for fp, n in self.counts.items() if n >= self.threshold]
         print(
             f"\n{len(self.counts)} unique signatures, {len(hot)} over threshold ({self.threshold}).\n"
@@ -90,7 +97,8 @@ class TriagePipeline:
     def _triage_one(self, fp: str):
         log, n = self.samples[fp], self.counts[fp]
         print(f"🔎 Triaging {fp[:12]} — {log['serviceName']} / {log['error']['class']} ({n}x)")
-        self.alert(log, n, self.triage(log, n))
+        verdict = self.triage_agentic(log, n) if self.agentic else self.triage(log, n)
+        self.alert(log, n, verdict)
 
     def _run_interactive(self, hot: list[str]):
         """One API call per pick. The free tier is 20/day — nothing is spent unasked."""
@@ -165,6 +173,122 @@ class TriagePipeline:
                 confidence=0.0,
                 needs_human_review=True,
             )
+
+    # --- Agentic path: the model pulls its own context through MCP -----------
+
+    def _agentic_prompt(self, log: dict, count: int) -> str:
+        return (
+            f"You are triaging a production error that fired {count} times.\n\n"
+            f"service: {log['serviceName']}\n"
+            f"class: {log['error']['class']}\n"
+            f"message: {log['message']}\n"
+            f"trace_id: {log.get('trace_id', 'unknown')}\n"
+            f"stack:\n{log['error'].get('stack', 'n/a')}\n\n"
+            "This traceback is your starting point, not your evidence. You have tools:\n"
+            "  read_source   — read the actual code behind any frame above\n"
+            "  search_code   — find callers, definitions, similar patterns\n"
+            "  get_logs      — pull the log lines around this error by trace_id or service\n"
+            "  line_history  — find when a specific line last changed, and in which commit\n\n"
+            "Investigate before concluding. Read the code at the deepest frame that is not "
+            "standard library. When you know what is wrong, call submit_verdict exactly once. "
+            "Do not answer in prose — the verdict only counts if it arrives through the tool."
+        )
+
+    def triage_agentic(self, log: dict, count: int) -> TriageVerdict:
+        """Let the model fetch its own context, then submit a verdict as a tool call.
+
+        Tools and response_schema do not compose — with both set the API returns a
+        dangling function_call and `parsed` is None. So the schema is enforced on our
+        side: submit_verdict's arguments are fed straight into the Pydantic model.
+        """
+        if self.client is None:
+            return self.triage(log, count)  # no key: fall back to the stub
+        return asyncio.run(self._agentic_call(log, count))
+
+    async def _agentic_call(self, log: dict, count: int) -> TriageVerdict:
+        # Imported here so the non-agentic pipeline never requires the mcp package.
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+
+        captured: dict[str, TriageVerdict] = {}
+
+        def submit_verdict(root_cause: str, severity: str, proposed_fix: str,
+                           confidence: float) -> str:
+            """Submit the final triage verdict. Call this exactly once, when you are done.
+
+            Args:
+                root_cause: The underlying cause, naming the specific code if you found it.
+                severity: CRITICAL, HIGH, MEDIUM or LOW.
+                proposed_fix: Concrete actionable steps.
+                confidence: 0.0 to 1.0.
+            """
+            captured["v"] = TriageVerdict(
+                root_cause=root_cause, severity=severity, proposed_fix=proposed_fix,
+                confidence=max(0.0, min(1.0, confidence)),
+                needs_human_review=False,  # the validator recomputes this
+            )
+            return "verdict recorded"
+
+        params = StdioServerParameters(
+            command=sys.executable, args=[str(Path(__file__).parent / "mcp_server.py")]
+        )
+        # errlog to devnull: the server logs every request to stderr, which is noise
+        # in front of a verdict. The tool calls are printed below instead.
+        with open(os.devnull, "w") as quiet:
+            async with stdio_client(params, errlog=quiet) as (reader, writer):
+                async with ClientSession(reader, writer) as session:
+                    await session.initialize()
+                    try:
+                        resp = await self.client.aio.models.generate_content(
+                            model=MODEL,
+                            contents=self._agentic_prompt(log, count),
+                            # A dict, not GenerateContentConfig: the object branch runs
+                            # config.model_copy(deep=True), and a live ClientSession
+                            # holds an _asyncio.Task, which cannot be pickled. The dict
+                            # branch constructs instead of copying.
+                            config={
+                                "tools": [session, submit_verdict],
+                                "automatic_function_calling":
+                                    types.AutomaticFunctionCallingConfig(
+                                        # +1: submit_verdict is itself a function call
+                                        # and counts against this. Without the slot the
+                                        # model spends the whole budget investigating
+                                        # and is cut off before it can answer.
+                                        maximum_remote_calls=AGENTIC_TOOL_BUDGET + 1
+                                    ),
+                            },
+                        )
+                    except errors.APIError as e:
+                        print(f"   ⚠️  API {e.code}: {e.message}")
+                        return self._failed_verdict(f"API {e.code}")
+
+        self._print_tool_calls(resp)
+        return captured.get("v") or self._fallback(resp)
+
+    @staticmethod
+    def _print_tool_calls(resp):
+        """Show what the model actually pulled — the whole point of the agentic path."""
+        for turn in resp.automatic_function_calling_history or []:
+            for part in turn.parts or []:
+                if fc := getattr(part, "function_call", None):
+                    args = ", ".join(f"{k}={v!r}" for k, v in (fc.args or {}).items())
+                    print(f"      ↳ {fc.name}({args[:120]})")
+
+    def _fallback(self, resp) -> TriageVerdict:
+        """The model spent its tool budget without submitting. Escalate, never guess."""
+        text = (getattr(resp, "text", "") or "").strip()
+        print("   ⚠️  no submit_verdict call — escalating")
+        return self._failed_verdict("no verdict submitted", detail=text[:400])
+
+    @staticmethod
+    def _failed_verdict(why: str, detail: str = "") -> TriageVerdict:
+        return TriageVerdict(
+            root_cause=f"Triage incomplete ({why}). {detail}".strip(),
+            severity="UNKNOWN",
+            proposed_fix="Re-run triage for this signature.",
+            confidence=0.0,  # validator flips needs_human_review to True
+            needs_human_review=True,
+        )
 
     def alert(self, log: dict, count: int, v: TriageVerdict):
         """Stage 5: mock Slack routing."""

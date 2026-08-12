@@ -78,6 +78,51 @@ don't trust the list endpoint.
 
 ---
 
+## Pulling context through MCP
+
+By default the model gets a context packet chosen for it before the call. With
+`--agentic` it fetches its own, through a stateless MCP server over stdio:
+
+```bash
+python realapp.py --agentic      # or: python mockapp.py --agentic
+```
+
+| Tool | What it answers |
+|---|---|
+| `read_source` | the actual code behind any frame in the traceback |
+| `search_code` | where is this defined, who else calls it |
+| `get_logs` | the lines around this error, by `trace_id` or service |
+| `line_history` | when this line last changed, and in which commit |
+
+The verdict comes back as a `submit_verdict` tool call, **not** via
+`response_schema` — with tools set, the API returns a dangling `function_call` and
+`parsed` is `None`. Pydantic validates the arguments on our side instead. If the
+model never submits, `_fallback()` escalates to human review rather than guessing.
+
+**This is the measured difference.** On the same injected PyYAML fault:
+
+- *Push*: identified the case mismatch, then proposed fixing the **YAML input files**.
+  The bug was in the library. Judge scored it 1.00 anyway.
+- *Pull*: named `constructor.py`, line 238, `bool_values[value.upper()]`, and proposed
+  reverting it to `.lower()` — the exact injection. It got there by calling
+  `search_code("bool_values")` to find where the dict is defined, which no pushed
+  context ever contained.
+
+Three implementation details that are load-bearing:
+
+- **`mcp` must be `<2`.** google-genai 2.17 reads `tool.inputSchema`; mcp 2.0 renamed it
+  `input_schema`, and the SDK's adapter raises `AttributeError` against 2.x.
+- **Pass `config` as a dict.** The `GenerateContentConfig` branch runs
+  `model_copy(deep=True)`, and a live `ClientSession` holds an unpicklable
+  `_asyncio.Task`.
+- **Budget is `+1`.** `submit_verdict` counts against `maximum_remote_calls`.
+  `TRIAGE_TOOL_BUDGET` (default 4) is the *investigation* budget; the verdict gets its
+  own slot.
+
+Cost: one agentic triage is up to 6 requests against a 20/day cap. The tools themselves
+are plain functions in `mcp_tools.py` — `python mcp_tools.py` exercises all four, plus
+the path jail, with no server and no API key.
+
 ## Architecture
 
 **Logs are produced by real failures.** Neither simulator writes log strings by hand.
@@ -150,6 +195,13 @@ manually: `git -C targets/pyyaml checkout -- .`
 - Interactive picker spending exactly one call per pick
 - Source-level context on injected PyYAML faults
 
+**Verified live 2026-08-12 (agentic path):**
+- MCP stdio handshake, all four tools listed with correct schemas
+- The path jail refusing `../../../etc/passwd` *through* the protocol, as a tool error
+- A full agentic triage: 3 tool calls plus `submit_verdict`, judged 1.00
+- `_fallback()` escalating when the model spent its budget without submitting — hit for
+  real on the first run, before the `+1` slot was added
+
 **Not verified:**
 - `HttpRetryOptions` backoff. It's configured on the client but has never successfully
   recovered a 429 in a completed run — the run that would have proven it was killed
@@ -177,11 +229,8 @@ manually: `git -C targets/pyyaml checkout -- .`
 
 ## Next steps
 
-**[`Plan.md`](Plan.md) — the next major piece of work: a stateless MCP toolserver** that
-lets the triage model *pull* context (source, code search, log queries, git line history)
-instead of receiving a fixed packet we chose for it. Fully planned, not yet implemented.
-
-Smaller items:
+The MCP toolserver in [`Plan.md`](Plan.md) is **built and verified** — see *Pulling
+context through MCP* above.
 
 1. **Grade `proposed_fix` too.** Highest value — it's the axis where the pipeline
    currently fails silently. Add a second field to `JudgeScore`.
