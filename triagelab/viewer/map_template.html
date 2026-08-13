@@ -78,6 +78,13 @@ svg#map { display:block; width:100%; height:auto; min-width:980px; }
 .scrub i.now { background:var(--actor); }
 .scrub i:hover { outline:1px solid var(--actor); }
 
+.focuswrap { display:flex; align-items:center; gap:7px; font-size:10px;
+  letter-spacing:.14em; text-transform:uppercase; color:var(--dim); font-weight:600; }
+.focuswrap select { font:inherit; font-size:12px; letter-spacing:0; text-transform:none;
+  font-weight:400; padding:4px 7px; border:1px solid var(--rule); border-radius:3px;
+  background:var(--bg); color:var(--ink); max-width:280px; }
+.failbar { background:#F6E0DE; color:var(--bad); font-weight:600; }
+
 /* ---------- readout ---------- */
 .read { display:grid; grid-template-columns:1.3fr .7fr; gap:0;
   border-bottom:1px solid var(--rule); }
@@ -215,6 +222,9 @@ body.live .ctl { display:flex; }
   <button id="play">▶ Play</button>
   <button id="reset">Restart</button>
   <span class="count" id="count"></span>
+  <label class="focuswrap">Showing
+    <select id="focus"></select>
+  </label>
   <div class="scrub" id="scrub"></div>
 </div>
 
@@ -366,9 +376,29 @@ const HUMAN = {
   "triage.judge":       ["The judge", "Ground truth enters here and nowhere earlier. Cause and fix are scored independently."],
 };
 
+/* Attribution is per walk, not per event. A walk runs from an ingest.gate enter
+   to its exit or halt; the ingest.fingerprint exit inside it names the signature
+   for every step in that walk, including the ones that ran before it was known.
+   Triage steps carry the fingerprint in their own payloads. */
+function attribute(events) {
+  const owner = {};                 // seq -> fingerprint
+  let walk = [], fp = null;
+  const flush = () => { walk.forEach(sq => owner[sq] = fp); walk = []; fp = null; };
+  const starts = e => e.kind === "enter"
+    && (e.node === "ingest.gate" || e.node === "triage.select");
+  for (const e of events) {
+    if (starts(e)) flush();
+    walk.push(e.seq);
+    if (e.payload && e.payload.fingerprint) fp = e.payload.fingerprint;
+  }
+  flush();
+  return owner;
+}
+
 function deriveSteps(run) {
   if (!run) return [];
   const out = [];
+  const owner = attribute(run.events);
   for (const e of run.events) {
     const p = e.payload || {};
     const [title, blurb] = HUMAN[e.node] || [e.node, ""];
@@ -394,6 +424,9 @@ function deriveSteps(run) {
       seq: e.seq, node: e.node, kind: e.kind, at: nodeOf(e.node), h: head, n: note,
       io: Object.entries(p).filter(([k]) => k !== "halted").map(([k, v]) => [k, String(v)]),
       agent, data, hash: (e.hash || "").slice(0, 12),
+      fp: owner[e.seq] || null,
+      service: p.service || null, cls: p.error_class || null,
+      failed: e.kind === "error",
     });
   }
   return out;
@@ -402,7 +435,9 @@ function deriveSteps(run) {
 /* Events name DAG nodes; a few need mapping onto a fixture on the map. */
 function nodeOf(node) { return LAYOUT[node] ? node : "handler"; }
 
-let STEPS = deriveSteps(RUN);
+let ALL = deriveSteps(RUN);      // every step, unfiltered
+let STEPS = ALL;                 // what the transport actually walks
+let FOCUS = "";                  // "" = everything; otherwise a fingerprint
 
 /* Ground truth and results come from the run too, not from this file. */
 let TRUTH = (RUN && RUN.truth) || {loc:"—", was:"", now:"", cause:
@@ -573,6 +608,78 @@ function animate(el, from, to, edgeId, ms) {
   requestAnimationFrame(frame);
 }
 
+
+/* ============================================================
+   Focus — one error at a time
+   ============================================================ */
+function signatures() {
+  /* Distinct signatures in this run, labelled by what they are. Ordered by
+     first appearance so the list reads like the run did. */
+  const seen = new Map();
+  for (const st of ALL) {
+    if (!st.fp) continue;
+    if (!seen.has(st.fp)) seen.set(st.fp, {fp: st.fp, service: null, cls: null, n: 0});
+    const s = seen.get(st.fp);
+    s.n++;
+    if (st.service && !s.service) s.service = st.service;
+    if (st.cls && !s.cls) s.cls = st.cls;
+  }
+  return [...seen.values()];
+}
+
+function triagedFp() {
+  const v = ALL.find(st => st.kind === "verdict");
+  return (v && v.fp) || "";
+}
+
+function applyFocus(fp) {
+  FOCUS = fp || "";
+  /* Run-level steps (the verdict, a failure) always show, so a filtered view
+     never hides what the run concluded. An ingest record with no signature was
+     turned away at the gate and belongs to nobody — it is not run-level. */
+  STEPS = FOCUS
+    ? ALL.filter(st => st.fp === FOCUS
+                    || (st.fp === null && !st.node.startsWith("ingest.")))
+    : ALL;
+  buildScrub();
+  step = 0; prevPos.log = prevPos.agent = null;
+  paint(false);
+}
+
+function buildFocusOptions() {
+  const sel = $("#focus");
+  if (!sel) return;
+  const sigs = signatures();
+  sel.innerHTML = "";
+  const all = document.createElement("option");
+  all.value = ""; all.textContent = `all events (${ALL.length} steps)`;
+  sel.appendChild(all);
+  sigs.forEach(sg => {
+    const o = document.createElement("option");
+    o.value = sg.fp;
+    const name = [sg.service, sg.cls].filter(Boolean).join(" ") || sg.fp.slice(0, 12);
+    o.textContent = `${name} — ${sg.n} steps`;
+    sel.appendChild(o);
+  });
+  /* Default to whatever was triaged: that is what the run was about. */
+  const want = triagedFp();
+  sel.value = sigs.some(sg => sg.fp === want) ? want : "";
+  sel.onchange = e => { stop(); applyFocus(e.target.value); };
+  applyFocus(sel.value);
+}
+
+function buildScrub() {
+  const sc = $("#scrub");
+  sc.innerHTML = "";
+  STEPS.forEach((st, i) => {
+    const b = document.createElement("i");
+    b.title = `${st.seq} · ${st.h}`;
+    if (st.failed) b.style.background = "var(--bad)";
+    b.onclick = () => { stop(); follow = false; go(i); };
+    sc.appendChild(b);
+  });
+}
+
 /* ============================================================
    Replay
    ============================================================ */
@@ -685,12 +792,7 @@ function closeDrawer() {
 }
 $("#d-close").onclick = closeDrawer; $("#scrim").onclick = closeDrawer;
 
-STEPS.forEach((s, i) => {
-  const b = document.createElement("i");
-  b.title = `${s.seq} · ${s.h}`;
-  b.onclick = () => { stop(); go(i); };
-  $("#scrub").appendChild(b);
-});
+buildFocusOptions();
 $("#next").onclick = () => { stop(); go(step + 1); };
 $("#prev").onclick = () => { stop(); go(step - 1); };
 $("#reset").onclick = () => { stop(); go(0, false); };
@@ -727,10 +829,20 @@ $("#t-diff").innerHTML = TRUTH.was
 /* The provenance line: which run this is, and whether it can be trusted. */
 if (RUN) {
   const bar = document.createElement("div");
-  bar.className = "prov" + (RUN.intact ? "" : " broken");
-  bar.textContent = RUN.intact
-    ? `run ${RUN.run_id} · ${RUN.mode} · ${RUN.events.length} events · chain verified`
-    : `run ${RUN.run_id} · CHAIN BROKEN — this replay does not match the run that produced it`;
+  const failed = ALL.find(st => st.failed);
+  bar.className = "prov" + (!RUN.intact ? " broken" : failed ? " failbar" : "");
+  if (!RUN.intact) {
+    bar.textContent = `run ${RUN.run_id} · CHAIN BROKEN — this replay does not match `
+      + `the run that produced it`;
+  } else if (failed) {
+    // A run that died mid-way must not read as a short but complete one.
+    const io = Object.fromEntries(failed.io || []);
+    bar.textContent = `run ${RUN.run_id} · FAILED at ${failed.node} — `
+      + `${io.type || ""}: ${io.message || ""} · ${RUN.events.length} events recorded`;
+  } else {
+    bar.textContent = `run ${RUN.run_id} · ${RUN.mode} · ${RUN.events.length} events`
+      + ` · chain verified`;
+  }
   $("#chrome-prov").appendChild(bar);
 } else {
   $("#now").innerHTML = "<b>No run loaded.</b> This is the template. "
@@ -745,16 +857,14 @@ go(0, false);
    ============================================================ */
 function rebuild(run) {
   RUN = run;
-  STEPS = deriveSteps(run);
   TRUTH = (run && run.truth) || TRUTH;
   RESULTS = (run && run.results) || [];
-  const sc = $("#scrub"); sc.innerHTML = "";
-  STEPS.forEach((s, i) => {
-    const b = document.createElement("i");
-    b.title = `${s.seq} · ${s.h}`;
-    b.onclick = () => { stop(); follow = false; go(i); };
-    sc.appendChild(b);
-  });
+  ALL = deriveSteps(run);
+  const keep = FOCUS;
+  buildFocusOptions();
+  if (keep && [...$("#focus").options].some(o => o.value === keep)) {
+    $("#focus").value = keep; applyFocus(keep);   // don't yank the view mid-run
+  }
   if (step >= STEPS.length) step = Math.max(0, STEPS.length - 1);
 }
 
@@ -808,7 +918,11 @@ async function loadRuns(select) {
   runs.forEach(r => {
     const o = document.createElement("option");
     o.value = r.run_id;
-    o.textContent = `${r.run_id}  ${r.mode}  ${r.events}ev${r.live ? "  ●live" : ""}`;
+    const off = ((r.condition || {}).disabled || []).length;
+    const t = r.run_id.slice(9, 11) + ":" + r.run_id.slice(11, 13) + ":" + r.run_id.slice(13, 15);
+    o.textContent = `${t} · ${r.label || "?"} · ${r.mode}`
+      + (off ? ` · ${off} off` : "") + (r.status && r.status.startsWith("failed") ? " · FAILED" : "")
+      + (r.live ? " · ●live" : "");
     sel.appendChild(o);
   });
   if (select) sel.value = select;
@@ -834,9 +948,19 @@ async function poll() {
       const bar = $("#chrome-prov").firstChild || (() => {
         const b = document.createElement("div"); b.className = "prov";
         $("#chrome-prov").appendChild(b); return b; })();
-      bar.innerHTML = (d.running ? '<span class="livedot"></span>' : "")
-        + `run ${watching} · ${events.length} events · `
-        + (d.running ? "running" : "finished");
+      // Same failure logic as the static page: a run that died must never read
+      // as a short but complete one, live or exported.
+      const failed = ALL.find(st => st.failed);
+      bar.className = "prov" + (failed ? " failbar" : "");
+      if (failed && !d.running) {
+        const io = Object.fromEntries(failed.io || []);
+        bar.textContent = `run ${watching} · FAILED at ${failed.node} — `
+          + `${io.type || ""}: ${io.message || ""} · ${events.length} events recorded`;
+      } else {
+        bar.innerHTML = (d.running ? '<span class="livedot"></span>' : "")
+          + `run ${watching} · ${events.length} events · `
+          + (d.running ? "running" : "finished");
+      }
     }
     if (d.running) timer = setTimeout(poll, 600);
     else { loadRuns(watching); timer = setTimeout(poll, 3000); }

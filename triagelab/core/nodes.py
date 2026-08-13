@@ -29,6 +29,7 @@ def _gate(ctx: dict):
     # Written into the context either way: a replay has to be able to say which
     # record was turned away, not just that something was.
     ctx.update({"service": r.get("serviceName"), "trace_id": r.get("trace_id"),
+                "error_class": (r.get("error") or {}).get("class"),
                 "message": (r.get("message") or "")[:200], "level": lvl})
     if lvl not in ("ERROR", "FATAL"):
         return HALT
@@ -58,7 +59,7 @@ def _count(ctx: dict) -> dict:
 # a day wants sampling, or gate decisions aggregated per batch.
 INGEST = DAG((
     Node("ingest.gate", fn=_gate,
-         records=("service", "trace_id", "message", "level", "passed")),
+         records=("service", "trace_id", "error_class", "message", "level", "passed")),
     Node("ingest.normalize", needs=("ingest.gate",), fn=_normalize,
          records=("raw_message", "normalized")),
     Node("ingest.fingerprint", needs=("ingest.normalize",), fn=_fingerprint,
@@ -75,7 +76,7 @@ def _select(ctx: dict) -> dict:
     """What the operator picked, and what it cost to look at it."""
     p, fp = ctx["pipeline"], ctx["fingerprint"]
     log = p.samples[fp]
-    return {"record": log, "count": p.counts[fp],
+    return {"record": log, "count": p.counts[fp], "fingerprint": fp,
             "service": log["serviceName"], "error_class": log["error"]["class"],
             "model": triage.MODEL}
 
@@ -135,7 +136,8 @@ def _judge(ctx: dict) -> dict:
 
 
 TRIAGE = DAG((
-    Node("triage.select", fn=_select, records=("service", "error_class", "count", "model")),
+    Node("triage.select", fn=_select,
+         records=("service", "error_class", "count", "model", "fingerprint")),
     # The branch is the reason this is a graph and not a list.
     Node("triage.context", needs=("triage.select",), fn=_context,
          when=lambda c: c["mode"] == "push", records=("context_chars",)),

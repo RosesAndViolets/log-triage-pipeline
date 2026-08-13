@@ -86,13 +86,15 @@ def cmd_runs(argv):
     if not runs:
         print("no runs yet — try:  python run.py mock --pick 1")
         return 0
-    print(f"{'run_id':<18} {'harness':<8} {'mode':<9} {'events':>7}  {'chain':<8} status")
+    print(f"{'run_id':<18} {'what it triaged':<34} {'mode':<8} {'ev':>5}  "
+          f"{'chain':<7} status")
     for r in runs:
-        cond = r.get("condition") or "{}"
-        harness = "real" if '"real"' in cond else "mock"
+        cond = r.get("condition") or {}
+        off = len(cond.get("disabled") or [])
         ok = "ok" if store.verify(r["run_id"]) is None else "BROKEN"
-        print(f"{r['run_id']:<18} {harness:<8} {r['mode']:<9} {r['events']:>7}  "
-              f"{ok:<8} {r['status']}")
+        label = r["label"] + (f"  ({off} off)" if off else "")
+        print(f"{r['run_id']:<18} {label:<34} {r['mode']:<8} {r['events']:>5}  "
+              f"{ok:<7} {r['status']}")
     return 0
 
 

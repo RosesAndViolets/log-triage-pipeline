@@ -254,12 +254,32 @@ def load_run(run_id: str) -> dict:
 
 
 def list_runs(limit: int = 20) -> list[dict]:
+    """Recent runs, each labelled by what it was about rather than only when it ran.
+
+    A list of timestamps all reading "push 175ev" tells you nothing about which
+    error you are looking at, which is the only thing you actually pick a run by.
+    """
     with runs_db() as c:
         rows = c.execute(
             "SELECT r.*, (SELECT COUNT(*) FROM event e WHERE e.run_id=r.run_id) AS events"
             " FROM run r ORDER BY started DESC LIMIT ?", (limit,)
         ).fetchall()
-    return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            # triage.select records what was picked; no row means nothing was triaged.
+            sel = c.execute(
+                "SELECT payload FROM event WHERE run_id=? AND node='triage.select'"
+                " AND kind='exit' ORDER BY seq LIMIT 1", (r["run_id"],)).fetchone()
+            d = dict(r)
+            if sel:
+                p = json.loads(sel["payload"])
+                d["label"] = (f"{p.get('service', '?')} {p.get('error_class', '?')}"
+                              f" {p.get('count', '?')}x")
+            else:
+                d["label"] = "not triaged"
+            d["condition"] = json.loads(r["condition"] or "{}")
+            out.append(d)
+    return out
 
 
 def _self_check():

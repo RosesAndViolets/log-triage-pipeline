@@ -189,7 +189,8 @@ class PipelineHandler(logging.Handler):
         if p.chain is None:
             p.ingest([entry])          # unbound: the old path, no record kept
             return
-        nodes.INGEST.run({"record": entry, "pipeline": p, "chain": p.chain}, p.chain)
+        nodes.INGEST.run({"record": entry, "pipeline": p, "chain": p.chain},
+                         p.chain, disabled=p.disabled)
 
 
 class EvalPipeline(triage.TriagePipeline):
@@ -370,6 +371,28 @@ def _self_check():
             == len(errors)
         # and the logs went to the store, scoped to this run
         assert len(store.query_logs(run_id="sc1", limit=10000)) == len(BUFFER)
+
+        # Switching a node off must stop it doing work — not merely omit it from
+        # the record. Tested on BOTH graphs: the previous version of this feature
+        # was verified on a triage node only, and ingest toggles were inert for a
+        # whole session because emit() never passed the set along.
+        for node, run_id in (("ingest.count", "sc2"), ("triage.judge", "sc3")):
+            reset()
+            with store.open_run(model="test", mode="stub", run_id=run_id) as (rid, ch):
+                p2 = EvalPipeline(threshold=3).bind(rid, ch, frozenset({node}))
+                p2.client = None
+                simulate(p2)
+                p2.run(interactive=False, agentic=False, pick=1)
+
+            ev = store.load_run(run_id)["events"]
+            ran = [e for e in ev if e["node"] == node and e["kind"] in ("enter", "exit")]
+            assert not ran, f"{node} was switched off and still ran {len(ran)} times"
+            skips = [e for e in ev if e["node"] == node and e["kind"] == "skip"]
+            assert skips and skips[0]["payload"]["why"] == "switched off", skips[:1]
+            # a sibling still ran, so this proves the toggle and not a dead graph
+            other = "ingest.fingerprint" if node.startswith("ingest") else "triage.route"
+            assert any(e["node"] == other and e["kind"] == "exit" for e in ev), \
+                f"nothing ran at all with {node} off — the graph died rather than skipped"
     finally:
         store.LOGS_DB, store.RUNS_DB = real
         shutil.rmtree(tmp, ignore_errors=True)
@@ -394,12 +417,11 @@ def main(argv: list[str]):
     with store.open_run(model=triage.MODEL, mode="agentic" if agentic else "push", run_id=run_id_in,
                         condition={"harness": "mock", "pick": pick,
                                    "disabled": sorted(disabled)}) as (run_id, chain):
-        pipeline = EvalPipeline(threshold=3).bind(run_id, chain)
+        pipeline = EvalPipeline(threshold=3).bind(run_id, chain, disabled)
         simulate(pipeline)
         print(f"\nsimulated {len(BUFFER)} log records across "
               f"{len({e['serviceName'] for e in BUFFER})} services")
-        pipeline.run(interactive=pick is None, agentic=agentic,
-                     pick=pick, disabled=disabled)
+        pipeline.run(interactive=pick is None, agentic=agentic, pick=pick)
         _report(pipeline)
         print(f"\nrun {run_id} recorded — replay with:"
               f"\n  python run.py export --run {run_id}")

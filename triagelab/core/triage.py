@@ -81,9 +81,17 @@ class TriagePipeline:
             else None
         )
 
-    def bind(self, run_id: str, chain):
-        """Attach this pipeline to an open run, so its steps land on the chain."""
+    def bind(self, run_id: str, chain, disabled=frozenset()):
+        """Attach this pipeline to an open run, so its steps land on the chain.
+
+        `disabled` is set here and nowhere else. It used to be set in run(),
+        which executes after every record has already been ingested — so ingest
+        nodes could never be switched off, however clearly the UI said they were.
+        Binding is what attaches the chain, so nothing can be ingested before
+        this point, which makes that ordering bug structurally impossible.
+        """
         self.run_id, self.chain = run_id, chain
+        self.disabled = frozenset(disabled)
         return self
 
     def ingest(self, logs: list[dict]):
@@ -96,15 +104,17 @@ class TriagePipeline:
             self.samples.setdefault(fp, log)
 
     def run(self, interactive: bool = False, agentic: bool = False,
-            pick: int | None = None, disabled=frozenset()):
+            pick: int | None = None):
         """Stage 3 & 4: LLM triage loop, then routing.
 
         `pick` triages the Nth hot signature (1-indexed) with no prompt. A run
         started by the server has no tty, so without this it would ingest and
         then decline to triage anything at all.
+
+        Note there is no `disabled` argument: it belongs to bind(), because by
+        the time this is called the ingest graph has already run.
         """
         self.agentic = agentic
-        self.disabled = frozenset(disabled)
         self.interactive = interactive and pick is None
         hot = [fp for fp, n in self.counts.items() if n >= self.threshold]
         print(

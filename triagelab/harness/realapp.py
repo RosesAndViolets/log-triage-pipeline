@@ -317,7 +317,7 @@ def main(argv: list[str]):
                        "seed": seed, "pick": pick, "disabled": sorted(disabled),
                        "reported": [f["service"] for f in chosen]},
         ) as (run_id, chain):
-            pipeline = SourcePipeline(threshold=3).bind(run_id, chain)
+            pipeline = SourcePipeline(threshold=3).bind(run_id, chain, disabled)
             exercise(pipeline, faults=chosen)
 
             # Put the injections back for the triage session. exercise() reverts each
@@ -333,8 +333,7 @@ def main(argv: list[str]):
                   f"   ({silent} unreported bug{'s' if silent != 1 else ''} in the code)")
             print(f"reported:  {', '.join(f['service'] for f in chosen) or 'none'}")
             print(f"{len(BUFFER)} log records from {TARGET.name}")
-            pipeline.run(interactive=pick is None, agentic=agentic,
-                         pick=pick, disabled=disabled)
+            pipeline.run(interactive=pick is None, agentic=agentic, pick=pick)
             mockapp._report(pipeline)
             print(f"\nrun {run_id} recorded — replay with:"
                   f"\n  python run.py export --run {run_id}")
