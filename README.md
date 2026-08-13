@@ -162,12 +162,16 @@ Same constructor fault, agentic, `gemini-3.1-flash-lite`:
 
 | Condition | Root cause | Proposed fix | Judge |
 |---|---|---|---|
-| `--injected 1` | case mismatch — correct | revert line 238 to `.lower()` — correct | 1.00 |
-| `--injected 9` | case mismatch — correct | add `'TRUE'`/`'FALSE'` to `bool_values` — **patches around the bug** | 1.00 |
+| `--injected 1` | case mismatch — correct | revert line 238 to `.lower()` — correct | cause 1.00 / fix 1.00 |
+| `--injected 9` | case mismatch — correct | add `'TRUE'`/`'FALSE'` to `bool_values` — **patches around the bug** | cause 1.00 / fix **0.20** |
+
+(The fix column is scored as of 2026-08-13; both runs originally showed a flat 1.00,
+which is what hid the difference.)
 
 The diagnosis survived eight decoys. The *remedy* did not: under noise it treated the
-injected `.upper()` as intended and proposed changing the dictionary to match it. Both
-scored 1.00, because the judge never reads `proposed_fix`.
+injected `.upper()` as intended and proposed changing the dictionary to match it. The
+grader now separates the two, so the run summary reports a **cause-minus-fix gap** — a
+pipeline that diagnoses well and prescribes badly no longer looks perfect.
 
 **One run per condition, and the model is nondeterministic — this is a hypothesis, not a
 finding.** Repeat across seeds before claiming the decoys caused it. That is what `--seed`
@@ -261,10 +265,13 @@ manually: `git -C targets/pyyaml checkout -- .`
 
 ## Known bugs and limitations
 
-1. **The judge only grades `root_cause`, never `proposed_fix`.** This is not theoretical:
-   on the PyYAML constructor fault the verdict correctly identified the `bool_values`
-   case mismatch, then proposed *fixing the YAML input files* — when the actual bug was
-   in the library code. It scored 1.00. Your grader is more lenient than it looks.
+1. ~~The judge only grades `root_cause`~~ — **fixed 2026-08-13.** `JudgeScore` now
+   carries `cause_correct`/`cause_score` and `fix_correct`/`fix_score`, graded
+   independently, and the prompt names the specific failure to catch: a remedy that
+   works around the defect, adapts other code to tolerate it, or tells the caller to
+   change their input. Verified by replaying both historical verdicts for the same
+   fault — the reverting fix scored `PASS 1.00`, the patch-around-it fix `FAIL 0.20`,
+   with identical cause scores of 1.00.
 2. **Counts reset every run.** `Counter` is in-memory; nothing accumulates across runs.
    `shelve` would be the lazy fix.
 3. **Verdicts are stdout-only.** Nothing is persisted, so you can't compare judge scores

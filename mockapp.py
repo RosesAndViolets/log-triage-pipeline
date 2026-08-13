@@ -43,9 +43,22 @@ def reset():
 
 
 class JudgeScore(BaseModel):
-    correct: bool = Field(description="True if the verdict identifies the same underlying cause.")
-    score: float = Field(ge=0.0, le=1.0, description="How well the verdict matches the true cause.")
-    reasoning: str = Field(description="One sentence explaining the score.")
+    """Two axes, because they fail independently.
+
+    A verdict can name the defect exactly and then propose a remedy that
+    accommodates it instead of removing it — observed, and invisible while only
+    the cause was graded.
+    """
+
+    cause_correct: bool = Field(description="True if the diagnosis identifies the same underlying cause.")
+    cause_score: float = Field(ge=0.0, le=1.0, description="How well the diagnosis matches the true cause.")
+    fix_correct: bool = Field(
+        description="True ONLY if the proposed fix removes the actual defect. "
+        "False if it works around the defect, changes something else to accommodate it, "
+        "or tells the caller to change their input."
+    )
+    fix_score: float = Field(ge=0.0, le=1.0, description="How well the proposed fix addresses the true defect.")
+    reasoning: str = Field(description="One sentence covering both the diagnosis and the fix.")
 
 
 class CapacityExceeded(Exception):
@@ -200,10 +213,12 @@ class EvalPipeline(triage.TriagePipeline):
             return
         score = self.judge(v, truth)
         if score:
-            mark = "✅ PASS" if score.correct else "❌ FAIL"
+            cause = "✅ PASS" if score.cause_correct else "❌ FAIL"
+            fix = "✅ PASS" if score.fix_correct else "❌ FAIL"
             print(
-                f"      ── judge: {mark}  match={score.score:.2f}  "
-                f"pipeline_confidence={v.confidence:.2f}\n"
+                f"      ── judge  cause: {cause} {score.cause_score:.2f}"
+                f"   fix: {fix} {score.fix_score:.2f}"
+                f"   pipeline_confidence={v.confidence:.2f}\n"
                 f"                 {score.reasoning}\n"
             )
             self.scores.append((score, v.confidence))
@@ -212,12 +227,20 @@ class EvalPipeline(triage.TriagePipeline):
         if self.client is None:
             return None
         prompt = (
-            "You are grading an automated log-triage system.\n\n"
+            "You are grading an automated log-triage system on two separate axes.\n\n"
             f"ACTUAL cause of the fault (ground truth):\n{truth}\n\n"
-            f"The system's diagnosis:\n{v.root_cause}\n\n"
-            "Did the system identify the same underlying cause? Judge the substance, "
-            "not the wording. Partial credit for a cause that is directionally right "
-            "but misses the mechanism."
+            f"The system's DIAGNOSIS:\n{v.root_cause}\n\n"
+            f"The system's PROPOSED FIX:\n{v.proposed_fix}\n\n"
+            "1. Diagnosis: did it identify the same underlying cause? Judge the substance, "
+            "not the wording. Partial credit for a cause that is directionally right but "
+            "misses the mechanism.\n\n"
+            "2. Fix: would it remove the defect described in the ground truth? The correct "
+            "remedy undoes what actually broke. A fix is WRONG — however plausible it "
+            "sounds — if it works around the defect, adapts other code or data to tolerate "
+            "it, or asks the caller to change their input. Treating the broken behaviour as "
+            "intended and patching elsewhere is the specific failure to catch here.\n\n"
+            "Grade the two independently: a correct diagnosis with a wrong fix is a real "
+            "and common outcome, and must score high on one and low on the other."
         )
         try:
             resp = self.client.models.generate_content(
@@ -310,7 +333,17 @@ if __name__ == "__main__":
 
     if pipeline.scores:
         n = len(pipeline.scores)
-        correct = sum(s.correct for s, _ in pipeline.scores)
-        print(f"\n{'='*60}\nGRADED: {correct}/{n} correct   "
-              f"mean judge score {sum(s.score for s, _ in pipeline.scores)/n:.2f}   "
-              f"mean pipeline confidence {sum(c for _, c in pipeline.scores)/n:.2f}\n{'='*60}")
+        s = [x for x, _ in pipeline.scores]
+        print(f"\n{'='*66}\n"
+              f"GRADED {n}   "
+              f"cause {sum(x.cause_correct for x in s)}/{n} correct, "
+              f"mean {sum(x.cause_score for x in s)/n:.2f}   "
+              f"fix {sum(x.fix_correct for x in s)}/{n} correct, "
+              f"mean {sum(x.fix_score for x in s)/n:.2f}\n"
+              f"       mean pipeline confidence "
+              f"{sum(c for _, c in pipeline.scores)/n:.2f}"
+              # The gap between these is the number worth watching: a pipeline that
+              # diagnoses well and prescribes badly looks perfect on cause alone.
+              f"   (cause-minus-fix gap "
+              f"{(sum(x.cause_score for x in s) - sum(x.fix_score for x in s))/n:+.2f})"
+              f"\n{'='*66}")
