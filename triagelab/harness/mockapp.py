@@ -206,6 +206,8 @@ class EvalPipeline(triage.TriagePipeline):
             if key not in seen:
                 seen.add(key)
                 lines.append(f"  [{e['trace_id']}] {e['level']:<5} {e['serviceName']}: {e['message']}")
+        self.last_context_meta = {"log_lines": len(lines),
+                                  "traces": sorted({k[0] for k in seen})}
         return "\n".join(lines)
 
     def alert(self, log: dict, count: int, v: triage.TriageVerdict):

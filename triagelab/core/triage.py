@@ -65,6 +65,9 @@ class TriagePipeline:
         self.disabled: frozenset = frozenset()
         self.interactive = True   # the grade prompt only makes sense with a tty
         self.last_tool_calls: list[dict] = []
+        # Identity of what the last _fetch_context call retrieved (files, log
+        # lines) — same pattern as last_tool_calls, recorded by triage.context.
+        self.last_context_meta: dict = {}
         self.last_score = None
         self.counts: Counter[str] = Counter()
         self.samples: dict[str, dict] = {}
@@ -175,7 +178,13 @@ class TriagePipeline:
             time.sleep(RPM_SLEEP)
 
     def _fetch_context(self, log: dict) -> str:
-        """Related log lines. Base pipeline has no log store — subclass to supply one."""
+        """Related log lines. Base pipeline has no log store — subclass to supply one.
+
+        Implementations must also set self.last_context_meta to say *what* was
+        retrieved, not just return it — a wrong verdict is only diagnosable if
+        the chain can show whether the right context was ever in the packet.
+        """
+        self.last_context_meta = {}
         return ""
 
     def triage(self, log: dict, count: int) -> TriageVerdict:

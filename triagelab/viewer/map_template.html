@@ -286,9 +286,8 @@ const LAYOUT = {
   "app":                {x:100, y:470, w:150, h:64, t:"realapp.py",   s:"exercise()",         k:"proc"},
   "handler":            {x:272, y:470, w:150, h:64, t:"mockapp.py",   s:"PipelineHandler",    k:"proc"},
   "ingest.gate":        {x:444, y:470, w:150, h:64, t:"ingest.gate",  s:"level filter",       k:"proc"},
-  "ingest.normalize":   {x:616, y:470, w:150, h:64, t:"ingest.normalize", s:"scrub volatile", k:"proc"},
-  "ingest.fingerprint": {x:788, y:470, w:150, h:64, t:"ingest.fingerprint", s:"md5 identity", k:"proc"},
-  "ingest.count":       {x:960, y:470, w:150, h:64, t:"ingest.count", s:"counts / threshold", k:"proc"},
+  "ingest.fingerprint": {x:674, y:470, w:170, h:64, t:"ingest.fingerprint", s:"scrub + md5 identity", k:"proc"},
+  "ingest.count":       {x:904, y:470, w:150, h:64, t:"ingest.count", s:"counts / threshold", k:"proc"},
   "triage.select":      {x:1132,y:470, w:150, h:64, t:"triage.select",s:"one pick, one call", k:"proc"},
 
   /* the branch — the reason this is a graph and not a list */
@@ -318,8 +317,7 @@ const Y = 470;
 const WIRES = [
   {id:"app>handler",              p:[[rt("app"),Y],[lf("handler"),Y]]},
   {id:"handler>ingest.gate",      p:[[rt("handler"),Y],[lf("ingest.gate"),Y]]},
-  {id:"ingest.gate>ingest.normalize",      p:[[rt("ingest.gate"),Y],[lf("ingest.normalize"),Y]]},
-  {id:"ingest.normalize>ingest.fingerprint",p:[[rt("ingest.normalize"),Y],[lf("ingest.fingerprint"),Y]]},
+  {id:"ingest.gate>ingest.fingerprint",    p:[[rt("ingest.gate"),Y],[lf("ingest.fingerprint"),Y]]},
   {id:"ingest.fingerprint>ingest.count",   p:[[rt("ingest.fingerprint"),Y],[lf("ingest.count"),Y]]},
   {id:"ingest.count>triage.select",        p:[[rt("ingest.count"),Y],[lf("triage.select"),Y]]},
 
@@ -365,8 +363,7 @@ const TOOL_TARGET = {get_logs:"logsdb", read_source:"source",
    ============================================================ */
 const HUMAN = {
   "ingest.gate":        ["Level gate", "Anything below ERROR stops here. INFO lines stay in the buffer as context but never become candidates, and never cost a request."],
-  "ingest.normalize":   ["Normalization", "Timestamps, UUIDs and every run of digits are scrubbed, so the same error hashes identically each time it happens."],
-  "ingest.fingerprint": ["Fingerprint", "Service, error class and the normalized message become one identity. Two errors sharing it are the same bug."],
+  "ingest.fingerprint": ["Fingerprint", "Timestamps, UUIDs and every run of digits are scrubbed, then service, error class and the normalized message become one identity. Two errors sharing it are the same bug."],
   "ingest.count":       ["Count and threshold", "The signature is counted and the first record kept as the specimen. Crossing the threshold is what makes it worth paying for."],
   "triage.select":      ["The operator picks", "Nothing is triaged automatically — a human picks a signature, and that pick is one request against a daily twenty."],
   "triage.context":     ["Push mode: context chosen for it", "The packet is assembled before the call. Whatever is not in it, the model cannot ask for."],

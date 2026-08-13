@@ -36,15 +36,18 @@ def _gate(ctx: dict):
     return {"passed": True}
 
 
-def _normalize(ctx: dict) -> dict:
-    raw = ctx["record"].get("message", "")
-    return {"raw_message": raw, "normalized": triage.normalize(raw)}
-
-
 def _fingerprint(ctx: dict) -> dict:
+    """Scrub volatile parts of the message, then hash the identity in one step.
+
+    Normalization exists only to feed the fingerprint, so it is not a node of
+    its own — one conceptual step, one event on the chain.
+    """
     r = ctx["record"]
-    key = f"{r['serviceName']}|{r['error']['class']}|{ctx['normalized']}"
-    return {"key": key, "fingerprint": triage.fingerprint(r)}
+    raw = r.get("message", "")
+    normalized = triage.normalize(raw)
+    key = f"{r['serviceName']}|{r['error']['class']}|{normalized}"
+    return {"raw_message": raw, "normalized": normalized,
+            "key": key, "fingerprint": triage.fingerprint(r)}
 
 
 def _count(ctx: dict) -> dict:
@@ -60,10 +63,8 @@ def _count(ctx: dict) -> dict:
 INGEST = DAG((
     Node("ingest.gate", fn=_gate,
          records=("service", "trace_id", "error_class", "message", "level", "passed")),
-    Node("ingest.normalize", needs=("ingest.gate",), fn=_normalize,
-         records=("raw_message", "normalized")),
-    Node("ingest.fingerprint", needs=("ingest.normalize",), fn=_fingerprint,
-         records=("key", "fingerprint")),
+    Node("ingest.fingerprint", needs=("ingest.gate",), fn=_fingerprint,
+         records=("raw_message", "normalized", "key", "fingerprint")),
     Node("ingest.count", needs=("ingest.fingerprint",), fn=_count,
          records=("fingerprint", "count", "hot", "threshold")),
 ))
@@ -82,9 +83,17 @@ def _select(ctx: dict) -> dict:
 
 
 def _context(ctx: dict) -> dict:
-    """Push mode: context is chosen for the model before the call."""
+    """Push mode: context is chosen for the model before the call.
+
+    The meta says *what* went into the packet, not just how much — without it a
+    wrong verdict cannot be split into "retrieval missed" vs "generation failed
+    despite good context".
+    """
     packet = ctx["pipeline"]._fetch_context(ctx["record"])
-    return {"context_chars": len(packet), "context": packet[:2000]}
+    meta = getattr(ctx["pipeline"], "last_context_meta", {})
+    return {"context_chars": len(packet), "context": packet[:2000],
+            "context_files": meta.get("files", []),
+            "context_log_lines": meta.get("log_lines", 0)}
 
 
 def _investigate(ctx: dict) -> dict:
@@ -120,12 +129,29 @@ def _judge(ctx: dict) -> dict:
 
     The grading call lives behind this node, so switching the node off actually
     saves the request rather than just omitting the record.
+
+    Component scores come first and cost nothing: whether the retrieved context
+    (push) or the tool calls (agentic) ever touched the file the fault lives in
+    is an exact check against ground truth — no model, no API key. It is what
+    lets a bad verdict be blamed on retrieval or on generation, not just noticed.
     """
     p = ctx["pipeline"]
+    comp = {}
+    tfile = getattr(p, "truth_file", None)   # only harnesses with a file locus
+    tf = tfile(ctx["record"]) if tfile else None
+    if tf:
+        comp["truth_file"] = tf
+        if ctx["mode"] == "push":
+            comp["context_hit"] = any(f.endswith(tf) for f in ctx.get("context_files", []))
+        else:
+            calls = getattr(p, "last_tool_calls", [])
+            comp["tool_hit"] = any(tf in json.dumps(c) for c in calls)
+        ctx["chain"].append("triage.judge", "component",
+                            {"fingerprint": ctx["fingerprint"], **comp})
     grade = getattr(p, "grade", None)
     score = grade(ctx["record"], ctx["verdict"]) if grade else None
     if score is None:
-        return {"graded": False}
+        return {"graded": False, **comp}
     ctx["chain"].append("triage.judge", "grade", {
         "fingerprint": ctx["fingerprint"],
         "cause_correct": score.cause_correct, "cause_score": score.cause_score,
@@ -140,14 +166,15 @@ TRIAGE = DAG((
          records=("service", "error_class", "count", "model", "fingerprint")),
     # The branch is the reason this is a graph and not a list.
     Node("triage.context", needs=("triage.select",), fn=_context,
-         when=lambda c: c["mode"] == "push", records=("context_chars",)),
+         when=lambda c: c["mode"] == "push",
+         records=("context_chars", "context_files", "context_log_lines")),
     Node("triage.investigate", needs=("triage.select",), fn=_investigate,
          when=lambda c: c["mode"] == "agentic", records=("tool_calls",)),
     Node("triage.verdict", needs=("triage.context", "triage.investigate"), fn=_verdict,
          records=("confidence", "needs_human_review")),
     Node("triage.route", needs=("triage.verdict",), fn=_route, records=("channel",)),
     Node("triage.judge", needs=("triage.route",), fn=_judge,
-         records=("graded", "cause_score", "fix_score")),
+         records=("graded", "cause_score", "fix_score", "context_hit", "tool_hit")),
 ))
 
 ALL_NODES = tuple(n.name for n in INGEST.nodes) + tuple(n.name for n in TRIAGE.nodes)
@@ -158,8 +185,7 @@ def _self_check():
 
     # Both graphs are acyclic and ordered sensibly.
     ing = [n.name for n in INGEST.order()]
-    assert ing == ["ingest.gate", "ingest.normalize", "ingest.fingerprint",
-                   "ingest.count"], ing
+    assert ing == ["ingest.gate", "ingest.fingerprint", "ingest.count"], ing
     tri = [n.name for n in TRIAGE.order()]
     assert tri.index("triage.select") < tri.index("triage.investigate") \
         < tri.index("triage.verdict") < tri.index("triage.route") \
@@ -169,11 +195,11 @@ def _self_check():
                                                             "triage.investigate"}
 
     # The map cannot silently drift from the pipeline: every node needs a home.
-    tpl = Path(__file__).parent / "map_template.html"
-    if tpl.exists():
-        html = tpl.read_text(encoding="utf-8")
-        missing = [n for n in ALL_NODES if f'"{n}"' not in html]
-        assert not missing, f"nodes with no LAYOUT entry in map_template.html: {missing}"
+    tpl = Path(__file__).parents[1] / "viewer" / "map_template.html"
+    assert tpl.exists(), f"map template not found at {tpl}"
+    html = tpl.read_text(encoding="utf-8")
+    missing = [n for n in ALL_NODES if f'"{n}"' not in html]
+    assert not missing, f"nodes with no LAYOUT entry in map_template.html: {missing}"
 
     # The gate is what stops an INFO line costing anything.
     assert _gate({"record": {"level": "INFO"}}) is HALT
@@ -184,8 +210,8 @@ def _self_check():
     reached = []
     probe = DAG((
         Node("ingest.gate", fn=_gate),
-        Node("ingest.normalize", needs=("ingest.gate",),
-             fn=lambda c: reached.append("normalize") or {}),
+        Node("ingest.fingerprint", needs=("ingest.gate",),
+             fn=lambda c: reached.append("fingerprint") or {}),
     ))
     probe.run({"record": {"level": "INFO", "message": "x"}})
     assert reached == [], "a dropped record walked past the gate"

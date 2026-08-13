@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS event (
   payload TEXT, prev_hash TEXT, hash TEXT, PRIMARY KEY (run_id, seq));
 """
 
-KINDS = ("enter", "exit", "skip", "error", "emit", "tool", "verdict", "grade")
+KINDS = ("enter", "exit", "skip", "error", "emit", "tool", "verdict", "grade",
+         "component")  # exact per-component scores (retrieval hit), no model involved
 
 
 def use_utf8_stdout():

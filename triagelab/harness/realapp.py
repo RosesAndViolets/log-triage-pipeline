@@ -25,6 +25,7 @@ from triagelab.harness.mockapp import BUFFER, TRUTH, EvalPipeline, PipelineHandl
 
 TARGET = Path(__file__).resolve().parents[2] / "targets" / "pyyaml"  # repo root
 LIB = TARGET / "lib"
+TRUTH_FILES: dict[str, str] = {}  # fingerprint -> the file the fault lives in
 FRAME_RE = re.compile(r'File "([^"]+)", line (\d+), in (\S+)')
 SOURCE_SPAN = 4  # lines of source shown either side of a failing line
 
@@ -188,8 +189,17 @@ class SourcePipeline(EvalPipeline):
 
     def _fetch_context(self, log: dict) -> str:
         source = log["error"].get("source", "")
-        trail = super()._fetch_context(log)
+        trail = super()._fetch_context(log)   # sets log_lines/traces in the meta
+        files = sorted(set(re.findall(r"^(\S+?):\d+ in ", source, re.M)))
+        self.last_context_meta = {**self.last_context_meta, "files": files}
         return f"{source}\n\nlog trail:\n{trail}" if source else trail
+
+    def truth_file(self, log: dict) -> str | None:
+        """Which file the injected fault lives in — the retrieval ground truth.
+
+        Read by the triage.judge node and nowhere earlier, same rule as TRUTH.
+        """
+        return TRUTH_FILES.get(triage.fingerprint(log))
 
 
 def exercise(pipeline, times: int = 3, faults: list[dict] | None = None):
@@ -199,6 +209,7 @@ def exercise(pipeline, times: int = 3, faults: list[dict] | None = None):
     injection breaks parsing outright and masks every fault downstream of it.
     """
     handler = PipelineHandler(pipeline)
+    TRUTH_FILES.clear()
     for f in faults if faults is not None else FAULTS:
         apply(f)
         try:
@@ -219,6 +230,7 @@ def exercise(pipeline, times: int = 3, faults: list[dict] | None = None):
                     entry = BUFFER[-1]
                     entry["error"]["source"] = render_source(entry["error"]["stack"])
                     TRUTH[triage.fingerprint(entry)] = f["true_cause"]
+                    TRUTH_FILES[triage.fingerprint(entry)] = f["file"]
         finally:
             revert()
 
@@ -278,6 +290,28 @@ def _self_check():
     ctx = p._fetch_context(p.samples[fp])
     assert "constructor.py" in ctx, ctx[:400]
     assert "bool_values[value.upper()]" in ctx, ctx[:400]  # the injected line itself
+
+    # Retrieval must be evaluatable, not just present: the meta names the files,
+    # and the fault's own file is the ground truth the judge node checks against.
+    tf = p.truth_file(p.samples[fp])
+    assert tf == "lib/yaml/constructor.py", tf
+    files = p.last_context_meta["files"]
+    assert any(f.endswith(tf) for f in files), files
+    assert p.last_context_meta["log_lines"] > 0, p.last_context_meta
+
+    # End to end, no API key: a stub run must land a component event on the
+    # chain saying whether retrieval reached the faulty file.
+    mockapp.reset()
+    with store.open_run(model="test", mode="stub", run_id="rc1") as (rid, chain):
+        p2 = SourcePipeline(threshold=3).bind(rid, chain)
+        p2.client = None
+        exercise(p2)
+        p2.run(interactive=False, agentic=False, pick=1)
+    ev = store.load_run("rc1")["events"]
+    comp = [e for e in ev if e["node"] == "triage.judge" and e["kind"] == "component"]
+    assert comp, "no component event — retrieval was never evaluated"
+    cp = comp[0]["payload"]
+    assert cp["context_hit"] is True, cp  # its own traceback names its own file
 
     # Faults must be isolated: identical exception classes everywhere means one
     # fault is masking the others (the scanner injection does exactly that).
