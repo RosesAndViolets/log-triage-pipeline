@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import sys
@@ -57,6 +58,14 @@ class TriagePipeline:
     def __init__(self, threshold: int = 3):
         self.threshold = threshold
         self.agentic = False
+        # Set by bind() when a run is opened. Without them the pipeline still
+        # works — it just leaves no record, which is the old behaviour.
+        self.run_id = ""
+        self.chain = None
+        self.disabled: frozenset = frozenset()
+        self.interactive = True   # the grade prompt only makes sense with a tty
+        self.last_tool_calls: list[dict] = []
+        self.last_score = None
         self.counts: Counter[str] = Counter()
         self.samples: dict[str, dict] = {}
         # The SDK retries 429/503 with exponential backoff itself — no hand-rolled retry loop.
@@ -72,6 +81,11 @@ class TriagePipeline:
             else None
         )
 
+    def bind(self, run_id: str, chain):
+        """Attach this pipeline to an open run, so its steps land on the chain."""
+        self.run_id, self.chain = run_id, chain
+        return self
+
     def ingest(self, logs: list[dict]):
         """Stage 1 & 2: dedup gate + normalization."""
         for log in logs:
@@ -81,13 +95,27 @@ class TriagePipeline:
             self.counts[fp] += 1
             self.samples.setdefault(fp, log)
 
-    def run(self, interactive: bool = False, agentic: bool = False):
-        """Stage 3 & 4: LLM triage loop, then routing."""
+    def run(self, interactive: bool = False, agentic: bool = False,
+            pick: int | None = None, disabled=frozenset()):
+        """Stage 3 & 4: LLM triage loop, then routing.
+
+        `pick` triages the Nth hot signature (1-indexed) with no prompt. A run
+        started by the server has no tty, so without this it would ingest and
+        then decline to triage anything at all.
+        """
         self.agentic = agentic
+        self.disabled = frozenset(disabled)
+        self.interactive = interactive and pick is None
         hot = [fp for fp, n in self.counts.items() if n >= self.threshold]
         print(
             f"\n{len(self.counts)} unique signatures, {len(hot)} over threshold ({self.threshold}).\n"
         )
+        if pick is not None:
+            if not 1 <= pick <= len(hot):
+                print(f"   ⚠️  --pick {pick} is out of range: {len(hot)} over threshold")
+                return
+            print(f"picking {pick} of {len(hot)} — model: {MODEL}")
+            return self._triage_one(hot[pick - 1])
         if interactive:
             return self._run_interactive(hot)
         for fp in hot:
@@ -97,8 +125,16 @@ class TriagePipeline:
     def _triage_one(self, fp: str):
         log, n = self.samples[fp], self.counts[fp]
         print(f"🔎 Triaging {fp[:12]} — {log['serviceName']} / {log['error']['class']} ({n}x)")
-        verdict = self.triage_agentic(log, n) if self.agentic else self.triage(log, n)
-        self.alert(log, n, verdict)
+        if self.chain is None:          # unbound: no run open, so nothing to record
+            verdict = self.triage_agentic(log, n) if self.agentic else self.triage(log, n)
+            self.alert(log, n, verdict)
+            return
+        from triagelab.core import nodes   # local: only the DAG path needs it
+
+        nodes.TRIAGE.run({
+            "pipeline": self, "chain": self.chain, "fingerprint": fp,
+            "mode": "agentic" if self.agentic else "push",
+        }, self.chain, disabled=self.disabled)
 
     def _run_interactive(self, hot: list[str]):
         """One API call per pick. The free tier is 20/day — nothing is spent unasked."""
@@ -229,12 +265,18 @@ class TriagePipeline:
             )
             return "verdict recorded"
 
+        # Launched as a module, not a file path: the server imports triagelab, so it
+        # needs the repo root importable. cwd anchors that on Windows too, where a
+        # bare script path would not resolve the package at all.
+        repo_root = Path(__file__).resolve().parents[2]
         params = StdioServerParameters(
-            command=sys.executable, args=[str(Path(__file__).parent / "mcp_server.py")]
+            command=sys.executable,
+            args=["-m", "triagelab.toolserver.server"],
+            cwd=str(repo_root),
         )
         # errlog to devnull: the server logs every request to stderr, which is noise
         # in front of a verdict. The tool calls are printed below instead.
-        with open(os.devnull, "w") as quiet:
+        with open(os.devnull, "w", encoding="utf-8") as quiet:
             async with stdio_client(params, errlog=quiet) as (reader, writer):
                 async with ClientSession(reader, writer) as session:
                     await session.initialize()
@@ -265,14 +307,30 @@ class TriagePipeline:
         self._print_tool_calls(resp)
         return captured.get("v") or self._fallback(resp)
 
-    @staticmethod
-    def _print_tool_calls(resp):
-        """Show what the model actually pulled — the whole point of the agentic path."""
+    def _print_tool_calls(self, resp):
+        """Show what the model pulled, and keep it — this is the agent's evidence.
+
+        Previously this only printed. The calls and what came back are the most
+        interesting thing the agentic path produces, and they were being thrown
+        away the moment the line scrolled past.
+        """
+        self.last_tool_calls = []
+        pending: dict[str, dict] = {}
         for turn in resp.automatic_function_calling_history or []:
             for part in turn.parts or []:
                 if fc := getattr(part, "function_call", None):
-                    args = ", ".join(f"{k}={v!r}" for k, v in (fc.args or {}).items())
-                    print(f"      ↳ {fc.name}({args[:120]})")
+                    args = dict(fc.args or {})
+                    rec = {"name": fc.name, "args": args, "result": ""}
+                    pending[fc.name] = rec
+                    self.last_tool_calls.append(rec)
+                    pretty = ", ".join(f"{k}={v!r}" for k, v in args.items())
+                    print(f"      ↳ {fc.name}({pretty[:120]})")
+                if fr := getattr(part, "function_response", None):
+                    # Pair the answer back onto its call so the chain records both.
+                    rec = pending.get(fr.name)
+                    if rec is not None:
+                        out = (fr.response or {}).get("result", fr.response)
+                        rec["result"] = str(out)[:1500]
 
     def _fallback(self, resp) -> TriageVerdict:
         """The model spent its tool budget without submitting. Escalate, never guess."""
@@ -399,10 +457,19 @@ def _self_check():
         confidence=0.81,
         needs_human_review=True,
     ).needs_human_review
+
+    # An unbound pipeline must still work — binding a run is what adds the
+    # record, not what makes triage function.
+    assert p.chain is None and p.run_id == ""
+    p.bind("r1", object())
+    assert p.run_id == "r1" and p.chain is not None
     print("self-check ok")
 
 
 if __name__ == "__main__":
+    from triagelab.core import store
+
+    store.use_utf8_stdout()
     _self_check()
     p = TriagePipeline(threshold=3)
     p.ingest(generate_mock_logs())

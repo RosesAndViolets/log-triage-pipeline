@@ -18,11 +18,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-import mockapp
-import triage
-from mockapp import BUFFER, TRUTH, EvalPipeline, PipelineHandler, new_trace
+from triagelab.harness import mockapp
+from triagelab.core import store
+from triagelab.core import triage
+from triagelab.harness.mockapp import BUFFER, TRUTH, EvalPipeline, PipelineHandler, new_trace
 
-TARGET = Path(__file__).parent / "targets" / "pyyaml"
+TARGET = Path(__file__).resolve().parents[2] / "targets" / "pyyaml"  # repo root
 LIB = TARGET / "lib"
 FRAME_RE = re.compile(r'File "([^"]+)", line (\d+), in (\S+)')
 SOURCE_SPAN = 4  # lines of source shown either side of a failing line
@@ -118,17 +119,35 @@ def select(logged: int, injected: int, seed: int) -> tuple[list[dict], list[dict
 
 def apply(fault: dict):
     p = TARGET / fault["file"]
-    src = p.read_text()
+    src = p.read_text(encoding="utf-8")
     if fault["old"] not in src:
         raise SystemExit(
             f"injection point not found in {fault['file']} — the clone has moved on.\n"
             f"Revert with: git -C {TARGET} checkout -- ."
         )
-    p.write_text(src.replace(fault["old"], fault["new"], 1))
+    p.write_text(src.replace(fault["old"], fault["new"], 1), encoding="utf-8")
 
 
 def revert():
     subprocess.run(["git", "-C", str(TARGET), "checkout", "--", "."], check=True)
+
+
+def in_target(path: str) -> bool:
+    """Is this path inside the cloned target?
+
+    Compared as a Path, not a string: Windows tracebacks carry backslashes, so
+    `"targets/" in path` is False there and every frame looks like ours.
+    """
+    try:
+        Path(path).resolve().relative_to(TARGET.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def rel_to_target(path: str) -> str:
+    """Repo-relative, forward-slashed — stable in output on either platform."""
+    return "targets/" + Path(path).resolve().relative_to(TARGET.resolve()).as_posix()
 
 
 def fresh_yaml():
@@ -137,7 +156,7 @@ def fresh_yaml():
         del sys.modules[name]
     import yaml
 
-    assert "targets/" in yaml.__file__, f"loaded the wrong pyyaml: {yaml.__file__}"
+    assert in_target(yaml.__file__), f"loaded the wrong pyyaml: {yaml.__file__}"
     return yaml
 
 
@@ -149,10 +168,10 @@ def render_source(stack: str) -> str:
     """
     blocks = []
     for path, lineno, func in FRAME_RE.findall(stack):
-        if "targets/" not in path:  # our own harness frames aren't the suspect
+        if not in_target(path):  # our own harness frames aren't the suspect
             continue
         try:
-            lines = Path(path).read_text().splitlines()
+            lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
         n = int(lineno)
@@ -160,7 +179,7 @@ def render_source(stack: str) -> str:
         body = "\n".join(
             f"  {'>' if i + 1 == n else ' '} {i + 1:>5} {lines[i]}" for i in range(lo, hi)
         )
-        blocks.append(f"targets/{path.split('targets/', 1)[1]}:{n} in {func}\n{body}")
+        blocks.append(f"{rel_to_target(path)}:{n} in {func}\n{body}")
     return "\n\n".join(blocks[-3:])  # deepest 3 frames: where it actually broke
 
 
@@ -204,10 +223,12 @@ def exercise(pipeline, times: int = 3, faults: list[dict] | None = None):
             revert()
 
 
-def _args() -> tuple[int, int, int]:
+def _args(argv=None) -> tuple[int, int, int]:
     """--logged Y, --injected X, --seed N. Defaults reproduce the previous behaviour."""
+    argv = sys.argv if argv is None else argv
+
     def opt(name, default):
-        return int(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
+        return int(argv[argv.index(name) + 1]) if name in argv else default
 
     logged = opt("--logged", len(FAULTS))
     injected = opt("--injected", logged)
@@ -221,9 +242,18 @@ def _args() -> tuple[int, int, int]:
 
 
 def _self_check():
+    # Self-sufficient about the clone: callable as `import realapp; _self_check()`
+    # without the caller knowing it needs targets/pyyaml/lib on the path.
+    if not LIB.exists():
+        print(f"skipped — no clone at {TARGET} (git clone --depth 1 "
+              f"https://github.com/yaml/pyyaml targets/pyyaml)")
+        return
+    if str(LIB) not in sys.path:
+        sys.path.insert(0, str(LIB))
+
     # Distractors rot like the real injection points do — fail loudly, not silently.
     for d in DISTRACTORS:
-        src = (TARGET / d["file"]).read_text()
+        src = (TARGET / d["file"]).read_text(encoding="utf-8")
         assert src.count(d["old"]) == 1, f"distractor site not unique: {d['file']} {d['old']!r}"
 
     # Selection: logged is always a subset of injected, and seeds are reproducible.
@@ -257,37 +287,68 @@ def _self_check():
           f"source context wired ({', '.join(classes)})")
 
 
-if __name__ == "__main__":
+def main(argv: list[str]):
+    """Entry point for `run.py real` and for the server's subprocess launch."""
     if not LIB.exists():
         raise SystemExit(
             f"missing clone. Run:\n  git clone --depth 1 "
             f"https://github.com/yaml/pyyaml {TARGET}"
         )
     sys.path.insert(0, str(LIB))
-    try:
-        _self_check()
 
-        logged, injected, seed = _args()
+    def opt(name, default=None):
+        return argv[argv.index(name) + 1] if name in argv else default
+
+    try:
+        logged, injected, seed = _args(argv)
         chosen, on_disk = select(logged, injected, seed)
+        agentic = "--agentic" in argv
+        pick = int(opt("--pick", 0)) or None
+        disabled = frozenset(a for a in opt("--disable", "").split(",") if a)
+        # The server picks the id up front so it can poll before we open the run.
+        run_id_in = opt("--run-id", "")
 
         mockapp.reset()
-        pipeline = SourcePipeline(threshold=3)
-        exercise(pipeline, faults=chosen)
+        # The condition is recorded with the run, so a noise-experiment result
+        # can never be read apart from the conditions that produced it.
+        with store.open_run(
+            model=triage.MODEL, mode="agentic" if agentic else "push", run_id=run_id_in,
+            condition={"harness": "real", "logged": logged, "injected": injected,
+                       "seed": seed, "pick": pick, "disabled": sorted(disabled),
+                       "reported": [f["service"] for f in chosen]},
+        ) as (run_id, chain):
+            pipeline = SourcePipeline(threshold=3).bind(run_id, chain)
+            exercise(pipeline, faults=chosen)
 
-        # Put the injections back for the triage session. exercise() reverts each fault
-        # as it goes, so by now the files are pristine — and read_source reads live disk,
-        # unlike the push-mode snapshot taken at log time. Without this the model would
-        # be handed correct code and asked why it crashed. Nothing executes from here on,
-        # so the masking that forced isolation during exercise() cannot bite.
-        for f in on_disk:
-            apply(f)
+            # Put the injections back for the triage session. exercise() reverts each
+            # fault as it goes, so by now the files are pristine — and read_source reads
+            # live disk, unlike the push-mode snapshot taken at log time. Without this the
+            # model would be handed correct code and asked why it crashed. Nothing
+            # executes from here on, so the masking that forced isolation cannot bite.
+            for f in on_disk:
+                apply(f)
 
-        silent = len(on_disk) - len(chosen)
-        print(f"\ncondition: {len(chosen)} logged / {len(on_disk)} injected / seed {seed}"
-              f"   ({silent} unreported bug{'s' if silent != 1 else ''} in the code)")
-        print(f"reported:  {', '.join(f['service'] for f in chosen) or 'none'}")
-        print(f"{len(BUFFER)} log records from {TARGET.name}")
-        pipeline.run(interactive=True, agentic="--agentic" in sys.argv)
+            silent = len(on_disk) - len(chosen)
+            print(f"\ncondition: {len(chosen)} logged / {len(on_disk)} injected / seed {seed}"
+                  f"   ({silent} unreported bug{'s' if silent != 1 else ''} in the code)")
+            print(f"reported:  {', '.join(f['service'] for f in chosen) or 'none'}")
+            print(f"{len(BUFFER)} log records from {TARGET.name}")
+            pipeline.run(interactive=pick is None, agentic=agentic,
+                         pick=pick, disabled=disabled)
+            mockapp._report(pipeline)
+            print(f"\nrun {run_id} recorded — replay with:"
+                  f"\n  python run.py export --run {run_id}")
+        return run_id
     finally:
         revert()  # ponytail: leaves the clone clean even on Ctrl-C
         print("clone reverted to pristine.")
+
+
+if __name__ == "__main__":
+    store.use_utf8_stdout()
+    if "--no-self-check" not in sys.argv:
+        if not LIB.exists():
+            raise SystemExit(f"missing clone: {TARGET}")
+        sys.path.insert(0, str(LIB))
+        _self_check()
+    main(sys.argv[1:])

@@ -11,7 +11,7 @@ Normally you don't: triage.py launches it as a subprocess over stdio.
 
 from mcp.server.fastmcp import FastMCP
 
-import mcp_tools
+from triagelab.toolserver import tools as mcp_tools
 
 # mcp must stay <2. google-genai 2.17 reads tool.inputSchema; mcp 2.0 renamed it
 # input_schema, so the SDK's own MCP adapter raises AttributeError against 2.x.

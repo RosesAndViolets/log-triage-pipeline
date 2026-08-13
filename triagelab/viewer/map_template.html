@@ -1,0 +1,900 @@
+<meta charset="utf-8">
+<title>Triage Pipeline — system map replay</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; }
+:root {
+  --bg:#F4F6F8; --panel:#FFFFFF; --sunk:#E9EDF1;
+  --ink:#16303F; --dim:#5C7789; --faint:#8CA2B0;
+  --rule:#C6D3DC;
+  --node:#2C5D7C; --node-dim:#8FAAC0; --node-live:#14405C;
+  --wire:#A9BDCA; --wire-live:#C1663F;
+  --actor:#C1663F; --actor-ink:#8A3F1E;
+  --data:#3E7D6B;
+  --ok:#2C6E49; --bad:#A8342A; --mut:#7B8F9C;
+  --f-ui:"Avenir Next","Segoe UI",-apple-system,"Helvetica Neue",sans-serif;
+  --f-mono:"SF Mono",Menlo,Consolas,"Roboto Mono",monospace;
+}
+body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--f-ui);
+  -webkit-font-smoothing:antialiased; }
+button { font:inherit; color:inherit; background:none; border:none; cursor:pointer; text-align:left; }
+:focus-visible { outline:2px solid var(--actor); outline-offset:2px; }
+
+/* ---------- header ---------- */
+.top { display:flex; gap:18px; align-items:flex-start; flex-wrap:wrap;
+  padding:12px 20px; background:var(--panel); border-bottom:1px solid var(--rule); }
+.top h1 { margin:0; font-size:12px; letter-spacing:.16em; text-transform:uppercase;
+  color:var(--dim); font-weight:600; white-space:nowrap; padding-top:3px; }
+.truth { flex:1 1 480px; border-left:3px solid var(--bad); padding-left:12px; }
+.truth .lab { font-size:9.5px; letter-spacing:.18em; text-transform:uppercase;
+  color:var(--bad); font-weight:700; }
+.truth .loc { font-family:var(--f-mono); font-size:12px; margin-top:2px; }
+.truth p { margin:4px 0 0; font-size:13px; line-height:1.5; max-width:76ch; }
+.truth .diff { font-family:var(--f-mono); font-size:11.5px; margin-top:4px; }
+.truth .diff s { color:var(--faint); }
+.truth .diff b { color:var(--bad); }
+.truth .hid { font-size:10.5px; color:var(--dim); font-style:italic; margin-top:3px; }
+
+/* ---------- map ---------- */
+.mapwrap { position:relative; background:var(--bg); overflow-x:auto; }
+svg#map { display:block; width:100%; height:auto; min-width:980px; }
+
+.nd rect { fill:var(--node); stroke:none; rx:7; transition:fill .25s, opacity .25s; }
+.nd.store rect { fill:var(--panel); stroke:var(--node); stroke-width:1.6; }
+.nd.ext rect { fill:var(--panel); stroke:var(--node); stroke-width:1.6; stroke-dasharray:5 3; }
+.nd.pending rect { fill:var(--node-dim); }
+.nd.live rect { fill:var(--node-live); }
+.nd.store.live rect, .nd.ext.live rect { fill:var(--sunk); stroke:var(--node-live); stroke-width:2.4; }
+.nd text.t { fill:#fff; font-size:13px; font-weight:600; }
+.nd text.s { fill:#C3D6E2; font-size:10.5px; font-family:var(--f-mono); }
+.nd.store text.t, .nd.ext text.t { fill:var(--ink); }
+.nd.store text.s, .nd.ext text.s { fill:var(--dim); }
+.nd { cursor:pointer; }
+.nd:hover rect { stroke:var(--actor); stroke-width:2.4; }
+.nd.live text.s { fill:#9FC4D8; }
+
+.wire { fill:none; stroke:var(--wire); stroke-width:1.6; transition:stroke .25s, stroke-width .25s; }
+.wire.live { stroke:var(--wire-live); stroke-width:2.6; }
+.wire.dash { stroke-dasharray:4 4; }
+
+.ring { fill:none; stroke:var(--actor); stroke-width:2; opacity:0; }
+.badge { font-family:var(--f-mono); font-size:10px; fill:var(--ink); }
+.badge-bg { fill:var(--panel); stroke:var(--rule); rx:3; }
+
+/* ---------- controls ---------- */
+.bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+  padding:10px 20px; background:var(--panel); border-bottom:1px solid var(--rule); }
+.bar button { border:1px solid var(--rule); padding:5px 13px; border-radius:3px;
+  font-size:12px; letter-spacing:.05em; text-transform:uppercase; text-align:center;
+  background:var(--panel); }
+.bar button:hover:not(:disabled) { border-color:var(--actor); color:var(--actor); }
+.bar button:disabled { opacity:.35; cursor:default; }
+.bar .go { background:var(--node); color:#fff; border-color:var(--node); }
+.bar .go:hover { background:var(--node-live); color:#fff; }
+.count { font-family:var(--f-mono); font-size:12px; color:var(--dim);
+  font-variant-numeric:tabular-nums; }
+.scrub { flex:1 1 200px; min-width:140px; display:flex; gap:2px; }
+.scrub i { flex:1; height:13px; background:var(--sunk); border-radius:1px; cursor:pointer; }
+.scrub i.past { background:#D9C3B6; }
+.scrub i.now { background:var(--actor); }
+.scrub i:hover { outline:1px solid var(--actor); }
+
+/* ---------- readout ---------- */
+.read { display:grid; grid-template-columns:1.3fr .7fr; gap:0;
+  border-bottom:1px solid var(--rule); }
+@media (max-width:900px){ .read { grid-template-columns:1fr; } }
+.read > div { padding:14px 20px; }
+.read .l { border-right:1px solid var(--rule); }
+@media (max-width:900px){ .read .l { border-right:none; border-bottom:1px solid var(--rule); } }
+.read h3 { margin:0 0 8px; font-size:10px; letter-spacing:.16em; text-transform:uppercase;
+  color:var(--dim); font-weight:600; }
+.read .now { margin:0 0 10px; font-size:15px; line-height:1.55; max-width:70ch; }
+.read .now code { font-family:var(--f-mono); font-size:.88em; background:var(--sunk);
+  padding:1px 4px; border-radius:2px; }
+dl.io { display:grid; grid-template-columns:auto 1fr; gap:5px 14px; margin:0;
+  font-family:var(--f-mono); font-size:11.5px; }
+dl.io dt { color:var(--dim); font-size:10px; letter-spacing:.08em; text-transform:uppercase;
+  padding-top:1px; }
+dl.io dd { margin:0; word-break:break-word; }
+.legend { display:flex; flex-direction:column; gap:7px; }
+.lg { display:flex; gap:9px; align-items:center; font-size:12px; }
+.lg .sw { width:26px; height:20px; flex:none; }
+.lg span.tx { color:var(--dim); }
+.lg b { font-weight:600; }
+
+/* ---------- results ---------- */
+.results { margin:0; background:var(--panel); border-bottom:1px solid var(--rule); }
+.results h3 { margin:0; padding:11px 20px; font-size:10px; letter-spacing:.16em;
+  text-transform:uppercase; color:var(--dim); font-weight:600;
+  border-bottom:1px solid var(--rule); }
+.rscroll { overflow-x:auto; }
+table.rt { border-collapse:collapse; width:100%; min-width:700px; font-size:13px; }
+table.rt th, table.rt td { text-align:left; padding:10px 20px; vertical-align:top;
+  border-bottom:1px solid var(--rule); line-height:1.45; }
+table.rt th { font-size:9.5px; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--dim); font-weight:600; }
+table.rt td.axis { font-family:var(--f-mono); font-size:11.5px; color:var(--dim); white-space:nowrap; }
+table.rt tr.pending td { opacity:.35; }
+.pill { display:inline-block; font-family:var(--f-mono); font-size:10px; padding:2px 7px;
+  border-radius:2px; }
+.pill.ok { background:var(--ok); color:#fff; }
+.pill.bad { background:var(--bad); color:#fff; }
+.pill.mut { background:var(--sunk); color:var(--mut); }
+.score { font-family:var(--f-mono); font-variant-numeric:tabular-nums; }
+
+
+/* ---------- live control panel (server mode only) ---------- */
+.ctl { display:none; gap:14px; align-items:flex-end; flex-wrap:wrap;
+  padding:12px 20px; background:var(--panel); border-bottom:1px solid var(--rule); }
+body.live .ctl { display:flex; }
+.ctl label { display:flex; flex-direction:column; gap:4px; font-size:10px;
+  letter-spacing:.14em; text-transform:uppercase; color:var(--dim); font-weight:600; }
+.ctl select, .ctl input[type=number] { font:inherit; font-size:13px; padding:5px 8px;
+  border:1px solid var(--rule); border-radius:3px; background:var(--bg); color:var(--ink);
+  min-width:96px; }
+.ctl .go2 { background:var(--node); color:#fff; border:1px solid var(--node);
+  padding:7px 18px; border-radius:3px; font-size:12px; letter-spacing:.06em;
+  text-transform:uppercase; text-align:center; }
+.ctl .go2:hover { background:var(--node-live); }
+.ctl .go2:disabled { opacity:.45; cursor:default; }
+.nodesoff { display:flex; flex-wrap:wrap; gap:4px 12px; max-width:520px; }
+.nodesoff span { display:flex; gap:5px; align-items:center; font-family:var(--f-mono);
+  font-size:11px; color:var(--ink); text-transform:none; letter-spacing:0; }
+.runsel { margin-left:auto; }
+.livedot { display:inline-block; width:7px; height:7px; border-radius:50%;
+  background:var(--actor); margin-right:6px; animation:pulse 1.1s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+
+/* ---------- drawer ---------- */
+.scrim { position:fixed; inset:0; background:rgba(12,28,38,.44); opacity:0;
+  pointer-events:none; transition:opacity .2s; z-index:50; }
+.scrim.on { opacity:1; pointer-events:auto; }
+.drawer { position:fixed; top:0; right:0; bottom:0; width:min(520px,94vw);
+  background:var(--panel); border-left:1px solid var(--rule); z-index:51;
+  transform:translateX(100%); transition:transform .24s cubic-bezier(.4,0,.2,1);
+  display:flex; flex-direction:column; }
+.drawer.on { transform:none; }
+.drawer header { display:flex; gap:12px; align-items:flex-start; padding:16px 18px;
+  border-bottom:1px solid var(--rule); }
+.drawer h2 { margin:0; font-size:16px; line-height:1.3; }
+.drawer .src { font-family:var(--f-mono); font-size:11px; color:var(--actor); margin-top:3px; }
+.drawer .x { margin-left:auto; font-size:22px; line-height:1; color:var(--dim); }
+.drawer .body { padding:16px 18px; overflow-y:auto; }
+.drawer p { margin:0 0 12px; font-size:14px; line-height:1.6; }
+.drawer pre { font-family:var(--f-mono); font-size:11.5px; line-height:1.55;
+  background:var(--bg); border:1px solid var(--rule); padding:11px 12px;
+  overflow-x:auto; margin:0 0 12px; white-space:pre; }
+.hint { font-size:11px; color:var(--dim); font-family:var(--f-mono); margin-top:12px; }
+.prov { font-family:var(--f-mono); font-size:11px; padding:4px 10px; border-radius:3px;
+  background:var(--sunk); color:var(--dim); display:inline-block; margin-bottom:6px; }
+.prov.broken { background:#F6E0DE; color:var(--bad); font-weight:600; }
+#chrome-prov { flex-basis:100%; }
+@media (prefers-reduced-motion:reduce){ *{transition:none!important;animation:none!important;} }
+</style>
+
+<div class="top">
+  <h1>Triage&nbsp;Map</h1>
+  <div id="chrome-prov"></div>
+  <div class="truth">
+    <div class="lab">Ground truth · withheld from the pipeline, shown only to the judge</div>
+    <div class="loc" id="t-loc"></div>
+    <p id="t-cause"></p>
+    <div class="diff" id="t-diff"></div>
+    <div class="hid" id="t-hid"></div>
+  </div>
+</div>
+
+
+<div class="ctl">
+  <label>Harness
+    <select id="c-harness"><option value="mock">mock</option><option value="real">real</option></select>
+  </label>
+  <label>Mode
+    <select id="c-mode"><option value="push">push</option><option value="agentic">agentic</option></select>
+  </label>
+  <label>Triage signature #
+    <input id="c-pick" type="number" min="1" max="9" value="1">
+  </label>
+  <label id="c-noisewrap" style="display:none">Injected / seed
+    <span style="display:flex;gap:6px">
+      <input id="c-injected" type="number" min="0" max="9" value="3" title="bugs on disk">
+      <input id="c-seed" type="number" min="0" value="0" title="seed">
+    </span>
+  </label>
+  <label style="flex:1 1 320px">Switch nodes off for this run
+    <div class="nodesoff" id="c-nodes"></div>
+  </label>
+  <button class="go2" id="c-start">Start run</button>
+  <label class="runsel">Watching
+    <select id="c-runs"></select>
+  </label>
+</div>
+
+<div class="bar">
+  <button id="prev">◀ Back</button>
+  <button class="go" id="next">Next ▶</button>
+  <button id="play">▶ Play</button>
+  <button id="reset">Restart</button>
+  <span class="count" id="count"></span>
+  <div class="scrub" id="scrub"></div>
+</div>
+
+<div class="mapwrap">
+  <svg id="map" viewBox="0 0 1900 920" role="img" aria-label="Pipeline system map">
+    <g id="g-wires"></g>
+    <g id="g-nodes"></g>
+    <g id="g-actors"></g>
+  </svg>
+</div>
+
+<div class="read">
+  <div class="l">
+    <h3>What is happening</h3>
+    <p class="now" id="now"></p>
+    <dl class="io" id="io"></dl>
+  </div>
+  <div>
+    <h3>Who is on the map</h3>
+    <div class="legend" id="legend"></div>
+  </div>
+</div>
+
+<div class="results">
+  <h3>Verdict against ground truth</h3>
+  <div class="rscroll"><table class="rt" id="res"></table></div>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <header>
+    <div><h2 id="d-title"></h2><div class="src" id="d-src"></div></div>
+    <button class="x" id="d-close" aria-label="Close">×</button>
+  </header>
+  <div class="body" id="d-body"></div>
+</aside>
+
+<script>
+/* ============================================================
+   This file is a TEMPLATE. export_run.py replaces the RUN line
+   below with one real run read out of runs.db.
+
+   The split that matters: the DAG owns which nodes exist, this
+   file owns where they sit. A node with no LAYOUT entry fails
+   nodes.py's self-check rather than vanishing from the picture.
+   ============================================================ */
+
+let RUN = /*__RUN_DATA__*/ null;
+/* Static when a run is inlined by export_run.py; live when served by
+   serve.py, which leaves the marker untouched. One template, two
+   sources — so the exported page and the served page cannot drift. */
+const LIVE = RUN === null;
+
+/* Node positions. Keys that contain a dot are DAG nodes and must match
+   nodes.ALL_NODES exactly; the rest are fixtures — stores and processes that
+   exist but are not steps. */
+const LAYOUT = {
+  /* the spine */
+  "app":                {x:100, y:470, w:150, h:64, t:"realapp.py",   s:"exercise()",         k:"proc"},
+  "handler":            {x:272, y:470, w:150, h:64, t:"mockapp.py",   s:"PipelineHandler",    k:"proc"},
+  "ingest.gate":        {x:444, y:470, w:150, h:64, t:"ingest.gate",  s:"level filter",       k:"proc"},
+  "ingest.normalize":   {x:616, y:470, w:150, h:64, t:"ingest.normalize", s:"scrub volatile", k:"proc"},
+  "ingest.fingerprint": {x:788, y:470, w:150, h:64, t:"ingest.fingerprint", s:"md5 identity", k:"proc"},
+  "ingest.count":       {x:960, y:470, w:150, h:64, t:"ingest.count", s:"counts / threshold", k:"proc"},
+  "triage.select":      {x:1132,y:470, w:150, h:64, t:"triage.select",s:"one pick, one call", k:"proc"},
+
+  /* the branch — the reason this is a graph and not a list */
+  "triage.context":     {x:1330,y:360, w:168, h:60, t:"triage.context",     s:"push mode",    k:"proc"},
+  "triage.investigate": {x:1330,y:580, w:168, h:60, t:"triage.investigate", s:"agentic mode", k:"proc"},
+
+  "triage.verdict":     {x:1540,y:470, w:158, h:64, t:"triage.verdict", s:"submit + validate",k:"proc"},
+  "triage.route":       {x:1730,y:470, w:150, h:64, t:"triage.route",   s:"alert()",          k:"proc"},
+  "triage.judge":       {x:1730,y:660, w:150, h:64, t:"triage.judge",   s:"grade vs truth",   k:"proc"},
+
+  /* stores and externals */
+  "buffer":  {x:272, y:300, w:158, h:68, t:"BUFFER",        s:"deque(maxlen=2000)", k:"store"},
+  "logsdb":  {x:520, y:150, w:176, h:72, t:"logs.db",       s:"what came in",       k:"store"},
+  "source":  {x:980, y:150, w:190, h:72, t:"targets/pyyaml",s:"source code",        k:"store"},
+  "mcp":     {x:1330,y:760, w:196, h:66, t:"mcp_server.py", s:"4 tools · stdio",    k:"proc"},
+  "api":     {x:1540,y:300, w:150, h:64, t:"Gemini API",    s:"generate_content",   k:"ext"},
+  "truth":   {x:1520,y:660, w:140, h:60, t:"TRUTH",         s:"ground truth",       k:"store"},
+  "runsdb":  {x:820, y:860, w:560, h:58, t:"runs.db · evidence chain",
+              s:"every step above lands here, hash-linked",                         k:"store"},
+};
+
+const L = id => LAYOUT[id];
+const rt = id => L(id).x + L(id).w/2, lf = id => L(id).x - L(id).w/2;
+const tp = id => L(id).y - L(id).h/2, bt = id => L(id).y + L(id).h/2;
+const Y = 470;
+
+const WIRES = [
+  {id:"app>handler",              p:[[rt("app"),Y],[lf("handler"),Y]]},
+  {id:"handler>ingest.gate",      p:[[rt("handler"),Y],[lf("ingest.gate"),Y]]},
+  {id:"ingest.gate>ingest.normalize",      p:[[rt("ingest.gate"),Y],[lf("ingest.normalize"),Y]]},
+  {id:"ingest.normalize>ingest.fingerprint",p:[[rt("ingest.normalize"),Y],[lf("ingest.fingerprint"),Y]]},
+  {id:"ingest.fingerprint>ingest.count",   p:[[rt("ingest.fingerprint"),Y],[lf("ingest.count"),Y]]},
+  {id:"ingest.count>triage.select",        p:[[rt("ingest.count"),Y],[lf("triage.select"),Y]]},
+
+  {id:"handler>buffer", p:[[272,tp("handler")],[272,bt("buffer")]]},
+  {id:"handler>logsdb", p:[[272,tp("buffer")],[272,210],[520,210],[520,bt("logsdb")]]},
+  {id:"buffer>triage.context",
+   p:[[rt("buffer"),300],[400,300],[400,250],[1330,250],[1330,tp("triage.context")]], dash:true},
+
+  /* the branch */
+  {id:"triage.select>triage.context",
+   p:[[rt("triage.select"),Y],[1246,Y],[1246,360],[lf("triage.context"),360]]},
+  {id:"triage.select>triage.investigate",
+   p:[[rt("triage.select"),Y],[1246,Y],[1246,580],[lf("triage.investigate"),580]]},
+  {id:"triage.context>triage.verdict",
+   p:[[rt("triage.context"),360],[1460,360],[1460,Y],[lf("triage.verdict"),Y]]},
+  {id:"triage.investigate>triage.verdict",
+   p:[[rt("triage.investigate"),580],[1460,580],[1460,Y],[lf("triage.verdict"),Y]]},
+
+  {id:"triage.investigate>mcp", p:[[1330,bt("triage.investigate")],[1330,tp("mcp")]]},
+  {id:"mcp>logsdb", p:[[lf("mcp"),760],[620,760],[620,bt("logsdb")]]},
+  {id:"mcp>source", p:[[lf("mcp"),730],[1080,730],[1080,bt("source")]]},
+  {id:"triage.verdict>api", p:[[1540,tp("triage.verdict")],[1540,bt("api")]], dash:true},
+
+  {id:"triage.verdict>triage.route", p:[[rt("triage.verdict"),Y],[lf("triage.route"),Y]]},
+  {id:"triage.route>triage.judge",   p:[[1730,bt("triage.route")],[1730,tp("triage.judge")]]},
+  {id:"truth>triage.judge",          p:[[rt("truth"),660],[lf("triage.judge"),660]], dash:true},
+
+  /* everything lands on the chain */
+  {id:"ingest.count>runsdb",   p:[[960,bt("ingest.count")],[960,tp("runsdb")]], dash:true},
+  {id:"triage.verdict>runsdb", p:[[1540,bt("triage.verdict")],[1540,820],[1100,820],[1100,tp("runsdb")]], dash:true},
+  {id:"triage.judge>runsdb",   p:[[lf("triage.judge"),660],[1440,660],[1440,830],[1200,830],[1200,tp("runsdb")]], dash:true},
+];
+
+const TOOLS = ["get_logs","read_source","search_code","line_history"];
+
+/* Which fixture a tool call reaches for, so the agent sprite has somewhere to go. */
+const TOOL_TARGET = {get_logs:"logsdb", read_source:"source",
+                     search_code:"source", line_history:"source"};
+
+/* ============================================================
+   Derive the replay from the chain. One step per recorded event,
+   in the order they were written — nothing invented here.
+   ============================================================ */
+const HUMAN = {
+  "ingest.gate":        ["Level gate", "Anything below ERROR stops here. INFO lines stay in the buffer as context but never become candidates, and never cost a request."],
+  "ingest.normalize":   ["Normalization", "Timestamps, UUIDs and every run of digits are scrubbed, so the same error hashes identically each time it happens."],
+  "ingest.fingerprint": ["Fingerprint", "Service, error class and the normalized message become one identity. Two errors sharing it are the same bug."],
+  "ingest.count":       ["Count and threshold", "The signature is counted and the first record kept as the specimen. Crossing the threshold is what makes it worth paying for."],
+  "triage.select":      ["The operator picks", "Nothing is triaged automatically — a human picks a signature, and that pick is one request against a daily twenty."],
+  "triage.context":     ["Push mode: context chosen for it", "The packet is assembled before the call. Whatever is not in it, the model cannot ask for."],
+  "triage.investigate": ["Agentic mode: it fetches its own", "Four read-only tools and a budget. Every call and what came back is recorded below."],
+  "triage.verdict":     ["The verdict", "It arrives as a tool call, because tools and response_schema do not compose. Pydantic validates it here, and recomputes needs_human_review rather than trusting it."],
+  "triage.route":       ["Routing", "Above 0.8 the fix is attached and the channel is quiet; below it, an engineer is named."],
+  "triage.judge":       ["The judge", "Ground truth enters here and nowhere earlier. Cause and fix are scored independently."],
+};
+
+function deriveSteps(run) {
+  if (!run) return [];
+  const out = [];
+  for (const e of run.events) {
+    const p = e.payload || {};
+    const [title, blurb] = HUMAN[e.node] || [e.node, ""];
+    let head = title, note = blurb, agent = null, data = [];
+
+    if (e.kind === "enter") continue;              // exit carries the outcome
+    if (e.kind === "skip") { head = title + " — skipped"; note = "This path was not taken: " + (p.why || ""); }
+    if (e.kind === "error") { head = title + " — failed"; note = `${p.type}: ${p.message}`; }
+    if (e.kind === "exit" && p.halted) {
+      head = `${p.level || "record"} turned away at the gate`;
+      note = `${p.service || "?"} · ${p.message || ""} — kept as context, never triaged.`;
+    }
+    if (e.kind === "tool") {
+      head = `Tool · ${p.name}`;
+      note = `${p.name}(${JSON.stringify(p.args || {}).slice(1, -1)}) — the agent asked for this; nobody packed it into the prompt.`;
+      agent = TOOL_TARGET[p.name] || "mcp";
+      data = [{l: p.name, at: "triage.investigate"}];
+    }
+    if (e.kind === "verdict") { head = "Verdict recorded"; note = p.root_cause || ""; }
+    if (e.kind === "grade")   { head = "Graded against truth"; note = p.reasoning || ""; }
+
+    out.push({
+      seq: e.seq, node: e.node, kind: e.kind, at: nodeOf(e.node), h: head, n: note,
+      io: Object.entries(p).filter(([k]) => k !== "halted").map(([k, v]) => [k, String(v)]),
+      agent, data, hash: (e.hash || "").slice(0, 12),
+    });
+  }
+  return out;
+}
+
+/* Events name DAG nodes; a few need mapping onto a fixture on the map. */
+function nodeOf(node) { return LAYOUT[node] ? node : "handler"; }
+
+let STEPS = deriveSteps(RUN);
+
+/* Ground truth and results come from the run too, not from this file. */
+let TRUTH = (RUN && RUN.truth) || {loc:"—", was:"", now:"", cause:
+  "No run loaded. This is the template — run export_run.py to fill it.", hid:""};
+
+let RESULTS = (RUN && RUN.results) || [];
+
+const DETAIL = Object.assign({
+ actor_log:{t:"The log record",s:"the thing moving through the map",
+  p:"One dict, reshaped and annotated at each stop. It arrives as a Python exception and leaves as a graded verdict in the chain.",
+  c:'{\n  "serviceName": …,\n  "level": "ERROR",\n  "message": …,\n  "trace_id": …,\n  "error": {"class": …, "stack": …, "source": …}\n}'},
+ actor_agent:{t:"The agent",s:"triage.py · _agentic_call()",
+  p:"Not a chat loop. Four read-only tools, a budget of four investigative calls, and one way to answer. If it never calls submit_verdict, _fallback escalates to a human rather than inventing something.",
+  c:'config={\n  "tools": [session, submit_verdict],\n  "automatic_function_calling": AutomaticFunctionCallingConfig(\n      maximum_remote_calls=AGENTIC_TOOL_BUDGET + 1)\n}'},
+ actor_data:{t:"Retrieved evidence",s:"what the tools hand back",
+  p:"Each piece travels back along the wire the request went out on. Everything the agent knows beyond its prompt arrived this way.",
+  c:"get_logs      → log lines for one trace\nread_source   → the code behind a frame\nsearch_code   → where a name is defined"},
+ runsdb:{t:"The evidence chain",s:"store.py · Chain",
+  p:"Every event carries the hash of the one before it, so the replay can be checked rather than trusted. verify() names the first row that does not add up — an edited payload and a deleted row both break the link.",
+  c:"hash = sha256(prev_hash | seq | node | kind | canonical_json(payload))"},
+ logsdb:{t:"logs.db — what came in",s:"store.py · write_log / query_logs",
+  p:"Separate from the chain on purpose: one is input the pipeline reads, the other is testimony about the pipeline. Records carry a run_id, so an earlier run's lines can never be served for this error — which is why nothing needs truncating between runs.",
+  c:"SELECT * FROM log WHERE run_id=? AND trace_id=?"},
+ mcp:{t:"MCP is a thin wrapper, on purpose",s:"mcp_server.py · FastMCP",
+  p:"The four tools are plain functions in mcp_tools.py with no MCP import, so the whole toolset — path jail included — is testable with no server, no protocol and no API key.",
+  c:'server = FastMCP(name="triage-tools")\nfor fn in mcp_tools.TOOLS:\n    server.tool()(fn)'},
+ source:{t:"targets/pyyaml — the code under the traceback",s:"read via mcp_tools._safe()",
+  p:"Every path the model supplies goes through the path jail: it picks these out of a traceback, and a traceback carries absolute paths pointing anywhere on the machine.",
+  c:"p = (ROOT / path).resolve()\nif not p.is_relative_to(ROOT):\n    raise ValueError(f\"path escapes the repo root: {path}\")"},
+ buffer:{t:"BUFFER — the context source",s:"mockapp.py · deque(maxlen=2000)",
+  p:"Holds every level. Push-mode context is built from here: the lines sharing the error's trace_id plus the tail from that service.",
+  c:"BUFFER = deque(maxlen=2000)"},
+ app:{t:"The failure is real",s:"realapp.py · exercise()",
+  p:"Nothing writes a log string by hand. A change is injected into a real PyYAML clone, the module re-imported from disk, and the library called. Python produces the exception, the frames and the line numbers.",
+  c:'apply(f)\nyaml = fresh_yaml()\nyaml.safe_load(f["doc"])'},
+ handler:{t:"One record, two destinations",s:"mockapp.py · PipelineHandler.emit()",
+  p:"Maps the LogRecord into the pipeline's dict shape, writes it to the in-memory buffer and to logs.db, then walks it through the ingest graph.",
+  c:"BUFFER.append(entry)\nstore.write_log(p.run_id, entry)\nnodes.INGEST.run({...}, p.chain)"},
+ api:{t:"The verdict is a tool call",s:"triage.py · _agentic_call()",
+  p:"Setting tools and response_schema together returns a dangling function_call with parsed=None — found by probing the live API. So submit_verdict carries the schema and Pydantic validates it on our side.",
+  c:'def submit_verdict(root_cause, severity, proposed_fix, confidence) -> str:\n    captured["v"] = TriageVerdict(...)'},
+ truth:{t:"Ground truth, withheld",s:"mockapp.TRUTH[fingerprint]",
+  p:"Written by the simulator at the moment the fault fires, and never logged, never in any prompt. The judge is the first thing in the system to read it.",
+  c:"TRUTH[triage.fingerprint(entry)] = f.true_cause"},
+}, Object.fromEntries(Object.keys(LAYOUT).filter(k => k.includes(".")).map(k =>
+   [k, {t: (HUMAN[k] || [k])[0], s: k, p: (HUMAN[k] || ["", ""])[1], c: ""}])));
+
+/* ============================================================
+   Build the map
+   ============================================================ */
+const SVGNS = "http://www.w3.org/2000/svg";
+const mk = (n, a={}) => { const e = document.createElementNS(SVGNS, n);
+  for (const k in a) e.setAttribute(k, a[k]); return e; };
+const $ = s => document.querySelector(s);
+
+const gW = $("#g-wires"), gN = $("#g-nodes"), gA = $("#g-actors");
+const wire = {}, nodeEl = {};
+
+WIRES.forEach(e => {
+  const d = e.p.map((pt, i) => (i ? "L" : "M") + pt[0] + " " + pt[1]).join(" ");
+  const p = mk("path", { d, class: "wire" + (e.dash ? " dash" : "") });
+  gW.appendChild(p); wire[e.id] = p;
+});
+
+for (const id in LAYOUT) {
+  const n = LAYOUT[id];
+  const g = mk("g", { class: "nd " + (n.k === "store" ? "store" : n.k === "ext" ? "ext" : ""),
+                      tabindex: "0", role: "button" });
+  g.appendChild(mk("rect", { x: n.x - n.w/2, y: n.y - n.h/2, width: n.w, height: n.h }));
+  const t1 = mk("text", { class:"t", x:n.x, y:n.y - 3, "text-anchor":"middle" }); t1.textContent = n.t;
+  const t2 = mk("text", { class:"s", x:n.x, y:n.y + 15, "text-anchor":"middle" }); t2.textContent = n.s;
+  g.appendChild(t1); g.appendChild(t2);
+  const open = () => openDrawer(id);
+  g.addEventListener("click", open);
+  g.addEventListener("keydown", ev => {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); open(); } });
+  gN.appendChild(g); nodeEl[id] = g;
+}
+
+/* A wire between two fixtures, either way round — the log runs the spine
+   forwards, the agent comes back down the same line it went out on. */
+function findWire(a, b) {
+  if (!a || !b || a === b) return null;
+  return wire[`${a}>${b}`] ? `${a}>${b}` : (wire[`${b}>${a}`] ? `${b}>${a}` : null);
+}
+
+/* ---- actor sprites: pixel agent, log sheet, data cylinder ---- */
+function spriteAgent() {
+  const g = mk("g");
+  const px = (x,y,w,h,f) => g.appendChild(mk("rect",{x,y,width:w,height:h,fill:f}));
+  const c = "var(--actor)";
+  px(-11,-11,22,14,c);
+  px(-15,-7,4,7,c); px(11,-7,4,7,c);
+  px(-9,3,4,8,c); px(-2,3,4,8,c); px(5,3,4,8,c);
+  px(-6,-7,3,3,"#20323C"); px(3,-7,3,3,"#20323C");
+  return g;
+}
+function spriteLog() {
+  const g = mk("g");
+  g.appendChild(mk("rect",{x:-9,y:-12,width:18,height:24,fill:"#fff",
+    stroke:"var(--ink)","stroke-width":1.6,rx:2}));
+  [-7,-3,1,5].forEach(y => g.appendChild(mk("rect",{x:-5,y,width:10,height:1.6,fill:"var(--dim)"})));
+  g.appendChild(mk("rect",{x:-5,y:8,width:7,height:1.6,fill:"var(--dim)"}));
+  return g;
+}
+function spriteData() {
+  const g = mk("g");
+  g.appendChild(mk("ellipse",{cx:0,cy:-7,rx:9,ry:3.4,fill:"#fff",
+    stroke:"var(--data)","stroke-width":1.6}));
+  g.appendChild(mk("path",{d:"M-9 -7 L-9 6 A9 3.4 0 0 0 9 6 L9 -7",fill:"#fff",
+    stroke:"var(--data)","stroke-width":1.6}));
+  g.appendChild(mk("ellipse",{cx:0,cy:0,rx:9,ry:3.4,fill:"none",
+    stroke:"var(--data)","stroke-width":1.2}));
+  return g;
+}
+function labelled(sprite, text, key) {
+  const g = mk("g", { style:"cursor:pointer" });
+  g.setAttribute("class", "actor");
+  g.appendChild(sprite);
+  if (text) {
+    const w = text.length * 5.6 + 12;
+    g.appendChild(mk("rect", { class:"badge-bg", x:-w/2, y:14, width:w, height:15 }));
+    const t = mk("text", { class:"badge", x:0, y:25, "text-anchor":"middle" });
+    t.textContent = text; g.appendChild(t);
+  }
+  g.addEventListener("click", () => openDrawer(key));
+  return g;
+}
+
+let elLog = labelled(spriteLog(), "log", "actor_log");
+let elAgent = labelled(spriteAgent(), "agent", "actor_agent");
+let elData = [];
+gA.appendChild(elLog); gA.appendChild(elAgent);
+elLog.style.display = elAgent.style.display = "none";
+
+/* Actors park clear of the box so they never cover the module name. */
+function at(id, kind, i = 0, of = 1) {
+  const n = LAYOUT[id] || LAYOUT["handler"];
+  if (kind === "data") return [ n.x + (i - (of - 1) / 2) * 84, n.y + n.h/2 + 26 ];
+  return [ n.x + (kind === "log" ? -36 : 36), n.y - n.h/2 - 32 ];
+}
+
+function animate(el, from, to, edgeId, ms) {
+  const path = edgeId ? wire[edgeId] : null;
+  const t0 = performance.now();
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches || !ms) {
+    el.setAttribute("transform", `translate(${to[0]},${to[1]})`); return;
+  }
+  const len = path ? path.getTotalLength() : 0;
+  let fwd = true;
+  if (path && len) {
+    const a = path.getPointAtLength(0), b = path.getPointAtLength(len);
+    const d = (p,q) => (p[0]-q.x)**2 + (p[1]-q.y)**2;
+    fwd = d(from,a) <= d(from,b);
+  }
+  function frame(t) {
+    const k = Math.min(1, (t - t0) / ms), e = k < .5 ? 2*k*k : 1 - (-2*k+2)**2/2;
+    let x, y;
+    if (path && len) {
+      const pt = path.getPointAtLength((fwd ? e : 1 - e) * len);
+      x = pt.x; y = pt.y;
+      if (e > .82) { const m = (e - .82) / .18; x += (to[0]-x)*m; y += (to[1]-y)*m; }
+      if (e < .18) { const m = 1 - e/.18; x += (from[0]-x)*m; y += (from[1]-y)*m; }
+    } else { x = from[0] + (to[0]-from[0])*e; y = from[1] + (to[1]-from[1])*e; }
+    el.setAttribute("transform", `translate(${x},${y})`);
+    if (k < 1) requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ============================================================
+   Replay
+   ============================================================ */
+let step = 0, playing = null;
+const prevPos = { log:null, agent:null };
+
+function paint(anim = true) {
+  if (!STEPS.length) return;
+  const s = STEPS[step], prev = step > 0 ? STEPS[step - 1] : null;
+  const edge = findWire(prev && prev.at, s.at);
+
+  const reached = new Set();
+  for (let k = 0; k <= step; k++) reached.add(STEPS[k].at);
+  for (const id in nodeEl) {
+    const n = LAYOUT[id];
+    const base = "nd " + (n.k === "store" ? "store " : n.k === "ext" ? "ext " : "");
+    nodeEl[id].setAttribute("class",
+      base + (id === s.at ? "live" : reached.has(id) ? "" : "pending"));
+  }
+  for (const id in wire) {
+    const w = WIRES.find(e => e.id === id);
+    wire[id].setAttribute("class", "wire" + (w.dash ? " dash" : "") + (id === edge ? " live" : ""));
+  }
+
+  [["log", elLog, s.at], ["agent", elAgent, s.agent]].forEach(([kind, el, target]) => {
+    if (!target) { el.style.display = "none"; prevPos[kind] = null; return; }
+    el.style.display = "";
+    const to = at(target, kind), from = prevPos[kind];
+    if (from && anim && (from[0] !== to[0] || from[1] !== to[1]))
+      animate(el, from, to, kind === "log" ? edge : findWire(prev && prev.agent, target), 500);
+    else el.setAttribute("transform", `translate(${to[0]},${to[1]})`);
+    prevPos[kind] = to;
+  });
+
+  elData.forEach(e => e.remove()); elData = [];
+  const carried = [];
+  for (let k = 0; k <= step; k++) (STEPS[k].data || []).forEach(d => carried.push(d));
+  carried.slice(-4).forEach((d, i, arr) => {
+    const g = labelled(spriteData(), d.l, "actor_data");
+    const p = at(d.at, "data", i, arr.length);
+    g.setAttribute("transform", `translate(${p[0]},${p[1]})`);
+    gA.appendChild(g); elData.push(g);
+  });
+
+  $("#now").innerHTML = "<b>" + s.h + ".</b> " + (s.n || "");
+  const io = $("#io"); io.innerHTML = "";
+  (s.io || []).slice(0, 8).forEach(([k, v]) => {
+    const dt = document.createElement("dt"); dt.textContent = k;
+    const dd = document.createElement("dd"); dd.textContent = v.length > 300 ? v.slice(0,300)+"…" : v;
+    io.appendChild(dt); io.appendChild(dd);
+  });
+
+  $("#count").textContent = `step ${step + 1} / ${STEPS.length}  ·  seq ${s.seq}`;
+  $("#prev").disabled = step === 0;
+  $("#next").disabled = step === STEPS.length - 1;
+  [...$("#scrub").children].forEach((b, i) =>
+    b.className = i < step ? "past" : i === step ? "now" : "");
+  paintResults();
+}
+
+function paintResults() {
+  const t = $("#res"); t.innerHTML = "";
+  if (!RESULTS.length) {
+    const r = t.insertRow(); const c = r.insertCell();
+    c.colSpan = 4;
+    c.textContent = "Nothing was triaged in this run — no verdict to compare.";
+    c.style.color = "var(--dim)";
+    return;
+  }
+  const h = t.insertRow();
+  ["Axis", "What the pipeline said", "Ground truth", "Judge"].forEach(x => {
+    const th = document.createElement("th"); th.textContent = x; h.appendChild(th); });
+  RESULTS.forEach(r => {
+    const tr = t.insertRow();
+    const shown = STEPS[step] && STEPS[step].seq >= r.at;
+    if (!shown) tr.className = "pending";
+    const a = tr.insertCell(); a.className = "axis"; a.textContent = r.axis;
+    tr.insertCell().textContent = shown ? r.got : "—";
+    tr.insertCell().textContent = shown ? r.truth : "—";
+    const c = tr.insertCell();
+    if (shown) {
+      const p = document.createElement("span");
+      p.className = "pill " + r.v;
+      p.textContent = r.v === "ok" ? "PASS" : r.v === "bad" ? "FAIL" : "—";
+      const sc = document.createElement("span");
+      sc.className = "score"; sc.textContent = " " + r.sc;
+      c.appendChild(p); c.appendChild(sc);
+    } else c.textContent = "—";
+  });
+}
+
+function go(i, anim = true) {
+  const n = Math.max(0, Math.min(STEPS.length - 1, i));
+  if (Math.abs(n - step) > 1) { prevPos.log = prevPos.agent = null; anim = false; }
+  step = n; paint(anim);
+}
+
+function openDrawer(key) {
+  const d = DETAIL[key]; if (!d) return;
+  $("#d-title").textContent = d.t; $("#d-src").textContent = d.s;
+  const b = $("#d-body"); b.innerHTML = "";
+  const p = document.createElement("p"); p.textContent = d.p; b.appendChild(p);
+  if (d.c) { const pre = document.createElement("pre"); pre.textContent = d.c; b.appendChild(pre); }
+  $("#drawer").classList.add("on"); $("#drawer").setAttribute("aria-hidden","false");
+  $("#scrim").classList.add("on");
+}
+function closeDrawer() {
+  $("#drawer").classList.remove("on"); $("#drawer").setAttribute("aria-hidden","true");
+  $("#scrim").classList.remove("on");
+}
+$("#d-close").onclick = closeDrawer; $("#scrim").onclick = closeDrawer;
+
+STEPS.forEach((s, i) => {
+  const b = document.createElement("i");
+  b.title = `${s.seq} · ${s.h}`;
+  b.onclick = () => { stop(); go(i); };
+  $("#scrub").appendChild(b);
+});
+$("#next").onclick = () => { stop(); go(step + 1); };
+$("#prev").onclick = () => { stop(); go(step - 1); };
+$("#reset").onclick = () => { stop(); go(0, false); };
+function stop() { if (playing) { clearInterval(playing); playing = null; $("#play").textContent = "▶ Play"; } }
+$("#play").onclick = () => {
+  if (playing) return stop();
+  $("#play").textContent = "❚❚ Pause";
+  playing = setInterval(() => { if (step >= STEPS.length - 1) stop(); else go(step + 1); }, 1100);
+};
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") closeDrawer();
+  if (e.key === "ArrowRight") { stop(); go(step + 1); }
+  if (e.key === "ArrowLeft") { stop(); go(step - 1); }
+});
+
+[["log","The error log","travels the spine, one record"],
+ ["agent","The agent","goes out for evidence, comes back"],
+ ["data","Retrieved data","returns along the wire it was asked over"]].forEach(([k, name, txt]) => {
+  const row = document.createElement("div"); row.className = "lg";
+  const svg = mk("svg", { viewBox:"-20 -18 40 40", class:"sw" });
+  svg.appendChild(k === "log" ? spriteLog() : k === "agent" ? spriteAgent() : spriteData());
+  row.appendChild(svg);
+  const d = document.createElement("div");
+  d.innerHTML = `<b>${name}</b> <span class="tx">— ${txt}</span>`;
+  row.appendChild(d); $("#legend").appendChild(row);
+});
+
+$("#t-loc").textContent = TRUTH.loc || "—";
+$("#t-cause").textContent = TRUTH.cause || "";
+$("#t-hid").textContent = TRUTH.hid || "";
+$("#t-diff").innerHTML = TRUTH.was
+  ? `<s>${TRUTH.was}</s> &nbsp;→&nbsp; <b>${TRUTH.now}</b>` : "";
+
+/* The provenance line: which run this is, and whether it can be trusted. */
+if (RUN) {
+  const bar = document.createElement("div");
+  bar.className = "prov" + (RUN.intact ? "" : " broken");
+  bar.textContent = RUN.intact
+    ? `run ${RUN.run_id} · ${RUN.mode} · ${RUN.events.length} events · chain verified`
+    : `run ${RUN.run_id} · CHAIN BROKEN — this replay does not match the run that produced it`;
+  $("#chrome-prov").appendChild(bar);
+} else {
+  $("#now").innerHTML = "<b>No run loaded.</b> This is the template. "
+    + "Run <code>python export_run.py --run &lt;id&gt; --out map.html</code> to fill it "
+    + "from a real run in runs.db.";
+}
+
+go(0, false);
+
+/* ============================================================
+   Live mode — only when served by serve.py
+   ============================================================ */
+function rebuild(run) {
+  RUN = run;
+  STEPS = deriveSteps(run);
+  TRUTH = (run && run.truth) || TRUTH;
+  RESULTS = (run && run.results) || [];
+  const sc = $("#scrub"); sc.innerHTML = "";
+  STEPS.forEach((s, i) => {
+    const b = document.createElement("i");
+    b.title = `${s.seq} · ${s.h}`;
+    b.onclick = () => { stop(); follow = false; go(i); };
+    sc.appendChild(b);
+  });
+  if (step >= STEPS.length) step = Math.max(0, STEPS.length - 1);
+}
+
+/* Derived from raw events, so the live view and the exported page agree. */
+function shape(runId, events, meta) {
+  const verdict = events.find(e => e.kind === "verdict");
+  const grade = events.find(e => e.kind === "grade");
+  const results = [];
+  if (verdict) {
+    const vp = verdict.payload;
+    if (grade) {
+      const gp = grade.payload;
+      results.push(
+        {axis:"Root cause", got: vp.root_cause || "", truth: gp.reasoning || "",
+         v: gp.cause_correct ? "ok" : "bad", sc: (gp.cause_score ?? 0).toFixed(2), at: grade.seq},
+        {axis:"Proposed fix", got: vp.proposed_fix || "",
+         truth:"Judged on whether it removes the defect, not whether it sounds right",
+         v: gp.fix_correct ? "ok" : "bad", sc: (gp.fix_score ?? 0).toFixed(2), at: grade.seq});
+    } else {
+      results.push(
+        {axis:"Root cause", got: vp.root_cause || "", truth:"not graded in this run",
+         v:"mut", sc:"—", at: verdict.seq},
+        {axis:"Proposed fix", got: vp.proposed_fix || "", truth:"not graded in this run",
+         v:"mut", sc:"—", at: verdict.seq});
+    }
+    results.push({axis:"Confidence",
+      got:`${(vp.confidence ?? 0).toFixed(2)} — ` + (vp.needs_human_review
+            ? "escalated to a human" : "cleared 0.8, routed without waking anyone"),
+      truth:"—", v:"mut", sc:(vp.confidence ?? 0).toFixed(2), at: verdict.seq});
+  }
+  return {run_id: runId, events, results, intact: true,
+          mode: (meta && meta.mode) || "", truth: (grade
+            ? {loc:"—", was:"", now:"", cause: grade.payload.reasoning || "",
+               hid:"Ground truth reaches nothing before the judge."}
+            : {loc:"—", was:"", now:"",
+               cause:"No grade recorded yet in this run.", hid:""})};
+}
+
+let watching = null, seen = -1, events = [], follow = true, timer = null;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(`${path} → ${r.status}`);
+  return r.json();
+}
+
+async function loadRuns(select) {
+  const runs = await api("/api/runs");
+  const sel = $("#c-runs");
+  sel.innerHTML = "";
+  runs.forEach(r => {
+    const o = document.createElement("option");
+    o.value = r.run_id;
+    o.textContent = `${r.run_id}  ${r.mode}  ${r.events}ev${r.live ? "  ●live" : ""}`;
+    sel.appendChild(o);
+  });
+  if (select) sel.value = select;
+  if (!watching && runs.length) watch(sel.value || runs[0].run_id);
+}
+
+function watch(runId) {
+  watching = runId; seen = -1; events = []; follow = true; step = 0;
+  prevPos.log = prevPos.agent = null;
+  $("#c-runs").value = runId;
+  poll();
+}
+
+async function poll() {
+  if (!watching) return;
+  try {
+    const d = await api(`/api/run/${watching}/events?since=${seen}`);
+    if (d.events.length) {
+      events = events.concat(d.events);
+      seen = events[events.length - 1].seq;
+      rebuild(shape(watching, events, {mode: $("#c-mode").value}));
+      if (follow) { step = STEPS.length - 1; paint(false); } else paint(false);
+      const bar = $("#chrome-prov").firstChild || (() => {
+        const b = document.createElement("div"); b.className = "prov";
+        $("#chrome-prov").appendChild(b); return b; })();
+      bar.innerHTML = (d.running ? '<span class="livedot"></span>' : "")
+        + `run ${watching} · ${events.length} events · `
+        + (d.running ? "running" : "finished");
+    }
+    if (d.running) timer = setTimeout(poll, 600);
+    else { loadRuns(watching); timer = setTimeout(poll, 3000); }
+  } catch (e) {
+    timer = setTimeout(poll, 2000);
+  }
+}
+
+async function startRun() {
+  const btn = $("#c-start"); btn.disabled = true; btn.textContent = "Starting…";
+  try {
+    const disable = [...document.querySelectorAll("#c-nodes input:checked")]
+      .map(i => i.value);
+    const spec = {
+      harness: $("#c-harness").value,
+      agentic: $("#c-mode").value === "agentic",
+      pick: Number($("#c-pick").value) || null,
+      disable,
+    };
+    if (spec.harness === "real") {
+      spec.injected = Number($("#c-injected").value);
+      spec.seed = Number($("#c-seed").value);
+    }
+    const r = await api("/api/start", {method:"POST", headers:{"Content-Type":"application/json"},
+                                       body: JSON.stringify(spec)});
+    if (r.error) throw new Error(r.error);
+    clearTimeout(timer);
+    watch(r.run_id);
+    await loadRuns(r.run_id);
+  } catch (e) {
+    alert("could not start: " + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "Start run";
+  }
+}
+
+if (LIVE) {
+  document.body.classList.add("live");
+  api("/api/graph").then(g => {
+    const box = $("#c-nodes");
+    g.nodes.forEach(n => {
+      const w = document.createElement("span");
+      const cb = document.createElement("input");
+      cb.type = "checkbox"; cb.value = n; cb.id = "off-" + n;
+      const lb = document.createElement("label");
+      lb.htmlFor = cb.id; lb.textContent = n;
+      lb.style.cssText = "text-transform:none;letter-spacing:0;font-size:11px;color:var(--ink)";
+      w.appendChild(cb); w.appendChild(lb); box.appendChild(w);
+    });
+  });
+  $("#c-start").onclick = startRun;
+  $("#c-runs").onchange = e => { clearTimeout(timer); watch(e.target.value); };
+  $("#c-harness").onchange = e =>
+    $("#c-noisewrap").style.display = e.target.value === "real" ? "flex" : "none";
+  // Any manual navigation stops the view chasing the tail.
+  ["#next","#prev","#reset","#play"].forEach(id =>
+    $(id).addEventListener("click", () => { follow = false; }, true));
+  loadRuns();
+}
+
+</script>

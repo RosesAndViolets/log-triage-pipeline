@@ -6,5 +6,8 @@ __pycache__/
 .vscode/
 .DS_Store
 
-# Log store — written per run, read by the MCP get_logs tool.
-run.jsonl
+# State databases and exported replays — build output, not source.
+data/
+
+# Exported replays are build output, not source.
+map.html

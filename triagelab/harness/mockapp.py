@@ -13,13 +13,16 @@ import logging
 import sys
 import urllib.request
 from collections import deque
+from pathlib import Path
 from typing import Callable
 
 from google.genai import errors, types
 from pydantic import BaseModel, Field
 
-import mcp_tools
-import triage
+from triagelab.toolserver import tools as mcp_tools  # noqa: F401  (kept so a stale import elsewhere still resolves)
+from triagelab.core import nodes
+from triagelab.core import store
+from triagelab.core import triage
 
 BUFFER = deque(maxlen=2000)  # every record, not just errors — INFO lines are the evidence
 TRUTH: dict[str, str] = {}  # fingerprint -> what actually broke. Never shown to the pipeline.
@@ -32,14 +35,15 @@ def new_trace() -> str:
 
 
 def reset():
-    """Start a run clean — in-memory buffers and the on-disk log store both.
+    """Clear the in-memory side channels between runs.
 
-    Without truncating the store, get_logs would serve the previous run's lines
-    and the model would reason about an error that is no longer there.
+    The log store is no longer truncated here: records carry a run_id and
+    get_logs filters on it, so an earlier run's lines cannot be served for this
+    error. Deleting the history to avoid confusing a query was always the
+    weaker fix — now the history is kept and the query is correct.
     """
     BUFFER.clear()
     TRUTH.clear()
-    mcp_tools.LOG_STORE.write_text("")
 
 
 class JudgeScore(BaseModel):
@@ -177,10 +181,15 @@ class PipelineHandler(logging.Handler):
             "error": {"class": cls, "stack": self.format(record) if record.exc_info else ""},
         }
         BUFFER.append(entry)
-        # Also to disk: the MCP server is a separate process and cannot read BUFFER.
-        with open(mcp_tools.LOG_STORE, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-        self.pipeline.ingest([entry])  # ingest() already drops non-ERROR levels
+        p = self.pipeline
+        if p.run_id:
+            # To disk as well: the MCP server is a separate process and cannot
+            # read BUFFER. Scoped by run_id, so nothing needs truncating.
+            store.write_log(p.run_id, entry)
+        if p.chain is None:
+            p.ingest([entry])          # unbound: the old path, no record kept
+            return
+        nodes.INGEST.run({"record": entry, "pipeline": p, "chain": p.chain}, p.chain)
 
 
 class EvalPipeline(triage.TriagePipeline):
@@ -199,18 +208,30 @@ class EvalPipeline(triage.TriagePipeline):
         return "\n".join(lines)
 
     def alert(self, log: dict, count: int, v: triage.TriageVerdict):
+        """Route, and show the truth for free. Grading is the judge node's job.
+
+        Grading used to happen here, which meant switching `triage.judge` off
+        removed it from the record while still spending the request. Now the
+        node owns it, so disabling the node actually disables the call.
+        """
         super().alert(log, count, v)
         truth = TRUTH.get(triage.fingerprint(log))
+        if truth:
+            print(f"      ── truth: {truth}")
+
+    def grade(self, log: dict, v: triage.TriageVerdict) -> JudgeScore | None:
+        """Called by the triage.judge node. One API call, and only if asked."""
+        truth = TRUTH.get(triage.fingerprint(log))
         if not truth:
-            return
-        print(f"      ── truth: {truth}")
-        try:
-            if input("      grade this verdict? [y/N] ").strip().lower() not in ("y", "yes"):
+            return None
+        if self.interactive:
+            try:
+                if input("      grade this verdict? [y/N] ").strip().lower() not in ("y", "yes"):
+                    print()
+                    return None
+            except EOFError:  # piped run — the truth line is free, grading is not
                 print()
-                return
-        except EOFError:  # piped run — the truth line above is free, grading is not
-            print()
-            return
+                return None
         score = self.judge(v, truth)
         if score:
             cause = "✅ PASS" if score.cause_correct else "❌ FAIL"
@@ -222,6 +243,7 @@ class EvalPipeline(triage.TriagePipeline):
                 f"                 {score.reasoning}\n"
             )
             self.scores.append((score, v.confidence))
+        return score
 
     def judge(self, v: triage.TriageVerdict, truth: str) -> JudgeScore | None:
         if self.client is None:
@@ -317,33 +339,96 @@ def _self_check():
     assert "consumer lag rising" in ctx, ctx
     assert "consumer lag rising" not in p.samples[acc]["message"]
 
-    print("self-check ok — 5 real exception types, 4 signatures over threshold, context wired")
+    # A bound run must leave a chain that reads as the ingestion actually went:
+    # gate/normalize/fingerprint/count for real errors, and the INFO lines
+    # halted at the gate rather than walking the whole graph.
+    import shutil
+    import tempfile
+
+    real = (store.LOGS_DB, store.RUNS_DB)
+    tmp = Path(tempfile.mkdtemp())
+    store.LOGS_DB, store.RUNS_DB = tmp / "l.db", tmp / "r.db"
+    try:
+        reset()
+        with store.open_run(model="test", mode="stub", run_id="sc1") as (rid, ch):
+            bound = EvalPipeline(threshold=3).bind(rid, ch)
+            bound.client = None          # no API key needed to exercise the graph
+            simulate(bound)
+
+        d = store.load_run("sc1")
+        assert d["intact"], "the chain a clean run wrote does not verify"
+        kinds = [(e["node"], e["kind"]) for e in d["events"]]
+        assert ("ingest.fingerprint", "exit") in kinds, kinds[:8]
+
+        halted = [e for e in d["events"]
+                  if e["node"] == "ingest.gate" and e["payload"].get("halted")]
+        errors = [e for e in BUFFER if e["level"] == "ERROR"]
+        assert len(halted) == len(BUFFER) - len(errors), \
+            f"{len(halted)} halted vs {len(BUFFER) - len(errors)} non-error records"
+        # nothing below ERROR reached fingerprinting
+        assert sum(1 for n, k in kinds if n == "ingest.fingerprint" and k == "exit") \
+            == len(errors)
+        # and the logs went to the store, scoped to this run
+        assert len(store.query_logs(run_id="sc1", limit=10000)) == len(BUFFER)
+    finally:
+        store.LOGS_DB, store.RUNS_DB = real
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("self-check ok — 5 real exception types, 4 signatures over threshold, "
+          "context wired, chain records ingestion")
 
 
-if __name__ == "__main__":
-    _self_check()
+def main(argv: list[str]):
+    """Entry point for `run.py mock` and for the server's subprocess launch."""
+    def opt(name, default=None):
+        return argv[argv.index(name) + 1] if name in argv else default
+
+    agentic = "--agentic" in argv
+    pick = int(opt("--pick", 0)) or None
+    disabled = frozenset(a for a in opt("--disable", "").split(",") if a)
+    # The server picks the id up front so it can poll before we open the run.
+    run_id_in = opt("--run-id", "")
 
     reset()
     EvalPipeline.scores = []
-    pipeline = EvalPipeline(threshold=3)
-    simulate(pipeline)
-    print(f"\nsimulated {len(BUFFER)} log records across "
-          f"{len({e['serviceName'] for e in BUFFER})} services")
-    pipeline.run(interactive=True, agentic="--agentic" in sys.argv)
+    with store.open_run(model=triage.MODEL, mode="agentic" if agentic else "push", run_id=run_id_in,
+                        condition={"harness": "mock", "pick": pick,
+                                   "disabled": sorted(disabled)}) as (run_id, chain):
+        pipeline = EvalPipeline(threshold=3).bind(run_id, chain)
+        simulate(pipeline)
+        print(f"\nsimulated {len(BUFFER)} log records across "
+              f"{len({e['serviceName'] for e in BUFFER})} services")
+        pipeline.run(interactive=pick is None, agentic=agentic,
+                     pick=pick, disabled=disabled)
+        _report(pipeline)
+        print(f"\nrun {run_id} recorded — replay with:"
+              f"\n  python run.py export --run {run_id}")
+    return run_id
 
-    if pipeline.scores:
-        n = len(pipeline.scores)
-        s = [x for x, _ in pipeline.scores]
-        print(f"\n{'='*66}\n"
-              f"GRADED {n}   "
-              f"cause {sum(x.cause_correct for x in s)}/{n} correct, "
-              f"mean {sum(x.cause_score for x in s)/n:.2f}   "
-              f"fix {sum(x.fix_correct for x in s)}/{n} correct, "
-              f"mean {sum(x.fix_score for x in s)/n:.2f}\n"
-              f"       mean pipeline confidence "
-              f"{sum(c for _, c in pipeline.scores)/n:.2f}"
-              # The gap between these is the number worth watching: a pipeline that
-              # diagnoses well and prescribes badly looks perfect on cause alone.
-              f"   (cause-minus-fix gap "
-              f"{(sum(x.cause_score for x in s) - sum(x.fix_score for x in s))/n:+.2f})"
-              f"\n{'='*66}")
+
+def _report(pipeline):
+    """The graded summary. Only meaningful when something was actually judged."""
+    if not pipeline.scores:
+        return
+    n = len(pipeline.scores)
+    s = [x for x, _ in pipeline.scores]
+    print(f"\n{'='*66}\n"
+          f"GRADED {n}   "
+          f"cause {sum(x.cause_correct for x in s)}/{n} correct, "
+          f"mean {sum(x.cause_score for x in s)/n:.2f}   "
+          f"fix {sum(x.fix_correct for x in s)}/{n} correct, "
+          f"mean {sum(x.fix_score for x in s)/n:.2f}\n"
+          f"       mean pipeline confidence "
+          f"{sum(c for _, c in pipeline.scores)/n:.2f}"
+          # The gap between these is the number worth watching: a pipeline that
+          # diagnoses well and prescribes badly looks perfect on cause alone.
+          f"   (cause-minus-fix gap "
+          f"{(sum(x.cause_score for x in s) - sum(x.fix_score for x in s))/n:+.2f})"
+          f"\n{'='*66}")
+
+
+if __name__ == "__main__":
+    store.use_utf8_stdout()
+    if "--no-self-check" not in sys.argv:
+        _self_check()
+    main(sys.argv[1:])

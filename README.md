@@ -16,39 +16,124 @@ logs ─→ dedup gate ─→ normalization ─→ frequency threshold ─→ LL
 
 ---
 
-## Quick start
+## Start to finish
+
+Everything goes through `run.py`. There is no other command to remember.
 
 ```bash
 git clone git@github.com:RosesAndViolets/log-triage-pipeline.git
 cd log-triage-pipeline
 pip install -r requirements.txt
 
-# Fault-injection target for realapp.py (not vendored — see Setup notes)
+# The fault-injection target: someone else's real repo, not vendored here.
 git clone --depth 1 https://github.com/yaml/pyyaml targets/pyyaml
 
+python run.py check          # 1. prove the wiring — no API key, no network
+python run.py mock --pick 1  # 2. one run, one triage, recorded
+python run.py runs           # 3. what got recorded
+python run.py serve          # 4. drive it from a browser
+```
+
+**Step 1 costs nothing and needs no key.** Nine self-checks plus the portability
+guard. If it passes, the pipeline is wired correctly on this machine — that is
+the first thing to run on a new laptop, and the first thing to run when something
+looks wrong.
+
+**Step 2 spends exactly one request.** Without `--pick` it shows a numbered menu
+and pressing `q` spends nothing. For a real key:
+
+```bash
 export GEMINI_API_KEY="your-key"     # from https://aistudio.google.com/apikey
-python mockapp.py
 ```
 
 A real key is 39 characters and starts with `AIza`. Put the export in `~/.zshenv`
 (not `~/.zshrc`) so non-interactive shells — VS Code's Run button, subprocesses —
-also see it.
+see it too. On Windows: `set GEMINI_API_KEY=...`, or
+`$env:GEMINI_API_KEY="..."` in PowerShell.
 
-**Nothing is spent until you ask.** Both simulators show a menu; pressing `q`
-triages nothing and makes zero API calls.
+### The commands
+
+| Command | What it does |
+|---|---|
+| `run.py check` | Every self-check plus portability. No key, no network, no quota. |
+| `run.py mock` | Synthetic faults: five services failing in realistic ways, graded against known causes. **Start here.** |
+| `run.py real` | Injects real bugs into the cloned PyYAML, runs it, triages the actual tracebacks. |
+| `run.py runs` | Every recorded run, with whether its chain still verifies. |
+| `run.py export` | One run → a standalone HTML replay you can send to somebody. |
+| `run.py serve` | The control surface: start runs, watch them, switch nodes off. |
+
+Flags that apply to both harnesses:
+
+| Flag | Means |
+|---|---|
+| `--agentic` | The model fetches its own context through the MCP tools, instead of being handed a packet. |
+| `--pick N` | Triage the Nth signature over threshold, no prompt. Without it you get the menu. |
+| `--disable NODE,NODE` | Switch DAG nodes off for this run. Recorded with the run. |
+| `--logged Y --injected X --seed N` | `real` only — the noise experiment. See below. |
+
+### Driving it from the browser
+
+```bash
+python run.py serve          # → http://127.0.0.1:8000
+```
+
+The page is the system map, live. You can:
+
+- **start a run** — pick the harness, push or agentic, and which signature to triage;
+- **watch the chain fill in** as it happens, node by node, rather than after the fact;
+- **switch nodes off** with the checkboxes, per run;
+- **scrub back** through any earlier run from the dropdown.
+
+Switching a node off is not cosmetic. `triage.judge` unchecked means the judge
+never runs — no prompt, no second API call — and the chain records
+`triage.judge skip "switched off"` while the run's `condition` remembers what was
+disabled. A result can never be read apart from the configuration that produced it.
+
+**The graph itself stays in `triagelab/core/nodes.py`.** The UI chooses which
+declared nodes fire; it cannot describe a graph the code is unable to run, so the
+chain always matches what actually happened. Adding or reordering a step is a code
+edit, deliberately.
+
+The server binds `127.0.0.1` and runs harnesses on request. It is a local
+development tool and should not listen on anything else.
+
+### Keeping a run
+
+```bash
+python run.py export --run 20260813T172501 --out map.html
+```
+
+One self-contained file — no server, no network, openable anywhere, publishable.
+It states its own provenance: run id, mode, event count, and whether the chain
+verified.
 
 ---
 
-## The three entry points
+## Layout
 
-| File | What it does | Run it? |
-|---|---|---|
-| `triage.py` | The pipeline itself: dedup, threshold, Gemini call, routing. Also has a small hand-written demo under `__main__`. | Library, mostly |
-| `mockapp.py` | Synthetic fault simulator. Five services fail in realistic ways; graded against known causes. | **Start here** |
-| `realapp.py` | Injects real bugs into a cloned PyYAML, runs it, triages the actual tracebacks. | The interesting one |
+```
+run.py                  the only entry point
+triagelab/
+  core/       store.py    two databases + the evidence chain
+              dag.py      the graph engine
+              nodes.py    the pipeline, declared as a graph
+              triage.py   dedup, threshold, the Gemini call, routing
+  toolserver/ tools.py    the four tools the model can pull with
+              server.py   the MCP stdio wrapper over them
+  harness/    mockapp.py  synthetic faults + the judge
+              realapp.py  real bugs injected into a real library
+  viewer/     serve.py       the live control surface
+              export_run.py  a run → a standalone page
+              map_template.html
+scripts/      check_portable.py
+docs/         Plan.md  tests_with_api.md
+data/         logs.db  runs.db          (gitignored)
+targets/      the cloned PyYAML         (gitignored)
+```
 
-Both simulators run an offline `_self_check()` first that needs no API key and no
-network. If that passes, the wiring is intact.
+Every module is runnable on its own for its self-check —
+`python -m triagelab.core.store` — which is what `run.py check` does for all of
+them at once.
 
 ---
 
@@ -66,7 +151,7 @@ except errors.APIError as e:
 
 Three things follow from this:
 
-- **The cap is per model.** `TRIAGE_MODEL=gemini-3.6-flash python mockapp.py` draws
+- **The cap is per model.** `TRIAGE_MODEL=gemini-3.6-flash python run.py mock` draws
   on a completely separate 20 from the default `gemini-3.1-flash-lite`.
 - **Picking is interactive** so you spend one call per triage, deliberately.
 - **Grading is opt-in** per verdict (`grade this verdict? [y/N]`), because the judge
@@ -84,7 +169,7 @@ By default the model gets a context packet chosen for it before the call. With
 `--agentic` it fetches its own, through a stateless MCP server over stdio:
 
 ```bash
-python realapp.py --agentic      # or: python mockapp.py --agentic
+python run.py real --agentic      # or: python run.py mock --agentic
 ```
 
 | Tool | What it answers |
@@ -120,7 +205,8 @@ Three implementation details that are load-bearing:
   own slot.
 
 Cost: one agentic triage is up to 6 requests against a 20/day cap. The tools themselves
-are plain functions in `mcp_tools.py` — `python mcp_tools.py` exercises all four, plus
+are plain functions in `triagelab/toolserver/tools.py` — `python -m triagelab.toolserver.tools`
+exercises all four, plus
 the path jail, with no server and no API key.
 
 ## Broken vs reported: the noise experiment
@@ -132,7 +218,7 @@ meets the other ninety — each a plausible culprit next to the real one.
 `realapp.py` separates the two:
 
 ```bash
-python realapp.py --agentic --logged 1 --injected 9 --seed 1
+python run.py real --agentic --logged 1 --injected 9 --seed 1
 #                            │           │            └ same seed, same run, every time
 #                            │           └ bugs present on disk while the model reads
 #                            └ bugs actually exercised, which produced the error logs
@@ -216,6 +302,78 @@ not the model's decision to make.
 
 ---
 
+## The DAG, the state engine, and the evidence chain
+
+The pipeline is a **declared graph**, not a call chain. `nodes.py` holds two DAGs —
+ingestion runs once per log record, triage runs once per signature somebody chose to
+spend a request on:
+
+```
+ingest.gate → ingest.normalize → ingest.fingerprint → ingest.count
+
+triage.select → triage.context      ─┐
+             └→ triage.investigate  ─┴→ triage.verdict → triage.route → triage.judge
+```
+
+The branch is the reason it is a graph: `triage.context` runs in push mode,
+`triage.investigate` in agentic mode, and which one ran is data rather than an `if`
+buried three frames down. `dag.py` walks it, and records every node's `enter`,
+`exit`, `skip` and `error` without each node remembering to. A node returning `HALT`
+ends that walk cleanly — an INFO line stopped at the gate is finished, not broken.
+
+**Node bodies call the functions that already existed.** `normalize()`,
+`fingerprint()`, `_fetch_context()`, `_agentic_call()` and `alert()` are unchanged
+and still work when called directly. This is a change of orchestration, not of logic.
+
+### Two databases, deliberately separate
+
+| | holds | why separate |
+|---|---|---|
+| `logs.db` | ingested log records | input the pipeline **reads** |
+| `runs.db` | `run` + `event` — the evidence chain | testimony **about** the pipeline |
+
+Every log row carries a `run_id`, so `get_logs` is scoped to the current run. That is
+what **removed the need to truncate logs between runs**: the old `run.jsonl` was
+wiped each time only so a stale line could not be served for a fresh error. Deleting
+history to keep a query honest was always the weaker fix — now the history is kept
+and the query is correct.
+
+### Why it is a chain and not a table
+
+Each event carries the hash of the one before it:
+
+```
+hash = sha256(prev_hash | seq | node | kind | canonical_json(payload))
+```
+
+`store.verify(run_id)` recomputes the whole thing and returns the first `seq` that
+fails, or `None`. An edited payload and a deleted row both break the link. This is
+what lets a replay be **checked rather than trusted** — without it, "a replay of a
+run" and "a drawing someone made" are the same artifact.
+
+```
+python run.py runs                          # every recorded run
+python -m triagelab.core.store --verdicts   # the flat verdict/grade view
+```
+
+### Replaying a run
+
+```
+python run.py runs
+python run.py export --run 20260813T172501 --out map.html
+```
+
+`triagelab/viewer/map_template.html` holds the node **positions**; `nodes.py` holds which nodes
+**exist**. A DAG node with no layout entry fails `nodes.py`'s self-check rather than
+quietly vanishing from the picture. The exported page states its own provenance —
+run id, mode, event count, and whether the chain verified — so a replay that does not
+match the run it claims to show says so on its face.
+
+`verdicts.jsonl` and `run.jsonl` are **gone**. Both are superseded by the chain, and
+carrying two records of the same fact is how records drift.
+
+---
+
 ## How `realapp.py` injects faults
 
 Three real bugs, each in a different PyYAML layer:
@@ -273,13 +431,24 @@ manually: `git -C targets/pyyaml checkout -- .`
    fault — the reverting fix scored `PASS 1.00`, the patch-around-it fix `FAIL 0.20`,
    with identical cause scores of 1.00.
 2. **Counts reset every run.** `Counter` is in-memory; nothing accumulates across runs.
-   `shelve` would be the lazy fix.
-3. **Verdicts are stdout-only.** Nothing is persisted, so you can't compare judge scores
-   before and after a prompt change.
-4. **Injection points are string matches** against upstream PyYAML source. If upstream
+   Still open — each run re-ingests a fresh batch, so there is no genuine cross-run
+   accumulation to preserve yet. `runs.db` is where it would live if there were.
+3. ~~Verdicts are stdout-only~~ — **fixed 2026-08-13.** Superseded the same day by the
+   evidence chain: verdicts and grades are `event` rows in `runs.db`, alongside every
+   other step. The interim `verdicts.jsonl` was removed rather than kept in parallel.
+   See *The DAG, the state engine, and the evidence chain* above.
+4. ~~`search_code` bypassed the path jail~~ — **found and fixed 2026-08-13.**
+   `read_source` and `line_history` both routed their argument through `_safe()`;
+   `search_code` walked `ROOT.glob(glob)` directly. A literal `..` segment is a
+   traversal step rather than a wildcard, so `search_code("x", "../*.py")` read and
+   returned files **outside** the repo root — defeating the exact threat `_safe()`
+   exists for, on one of the four tools the model can call. Every glob hit now goes
+   through `_safe()`. The self-check builds a temp root with a sibling file one level
+   up and asserts it stays invisible; reverting the fix makes that assertion fail.
+5. **Injection points are string matches** against upstream PyYAML source. If upstream
    moves, `apply()` fails loudly with the revert command rather than silently injecting
    nothing — but they will eventually need updating.
-5. **Fault masking is a live hazard.** Fixed by isolation; the `realapp.py` self-check
+6. **Fault masking is a live hazard.** Fixed by isolation; the `realapp.py` self-check
    asserts more than one distinct exception class specifically to catch a regression.
 
 ---
@@ -289,15 +458,18 @@ manually: `git -C targets/pyyaml checkout -- .`
 The MCP toolserver in [`Plan.md`](Plan.md) is **built and verified** — see *Pulling
 context through MCP* above.
 
-1. **Grade `proposed_fix` too.** Highest value — it's the axis where the pipeline
-   currently fails silently. Add a second field to `JudgeScore`.
-2. **Persist verdicts** to `verdicts.csv` (~6 lines with `csv.writer`), so prompt and
-   model changes can be compared instead of eyeballed.
-3. **Persist counts** with `shelve` if you ever feed this a live stream rather than a
+Everything below needing a live key is specified in
+[`tests_with_api.md`](tests_with_api.md) — what to run, what it costs, and what to
+look for — so it can be executed in one sitting on a machine with quota.
+
+1. **Run the noise-experiment seed sweep.** The highest-value open question, and now
+   measurable: the cause/fix split can see degradation, and `runs.db` holds every run's
+   chain and condition across the several days the sweep will take. Currently n=1.
+2. **Persist counts** with `shelve` if you ever feed this a live stream rather than a
    batch.
-4. **Retry/backoff verification** — confirm `HttpRetryOptions` actually recovers a 429
-   on a day with quota remaining.
-5. **More fault classes** — concurrency and resource-exhaustion bugs are the ones where
+3. **Retry/backoff verification** — confirm `HttpRetryOptions` actually recovers a 429
+   on a day with quota remaining. Never once observed.
+4. **More fault classes** — concurrency and resource-exhaustion bugs are the ones where
    context fetching should pay off most, and they're not represented yet.
 
 ---
@@ -312,3 +484,51 @@ setup step is needed on the other side beyond `pip install -r requirements.txt` 
 API key. No source file contains an absolute path.
 
 **Interpreter:** developed on conda env `yue`, Python 3.13.2. Any Python ≥3.10 works.
+
+---
+
+## Running this on Windows
+
+The repo is meant to clone onto a Windows machine and work. `python run.py check`
+guards that, and it is worth running before you push:
+
+```
+python run.py check
+```
+
+It fails on the four things that break silently on macOS and loudly on Windows.
+Each was a real bug in this repo, not a hypothetical:
+
+1. **Text I/O without `encoding=`.** Windows defaults to the locale code page
+   (usually cp1252), so the non-ASCII this repo genuinely contains — em dashes in log
+   messages, arrows in output — either mangles or raises. Every `open`, `read_text`
+   and `write_text` now passes `encoding="utf-8"`; the checker walks the AST to prove
+   it, and exempts binary mode.
+2. **Paths compared as strings.** `"targets/" in path` is False on Windows, where
+   tracebacks carry backslashes — so `realapp.py` would have treated every library
+   frame as its own and captured no source at all. Now `in_target()` compares
+   resolved `Path` objects, and `rel_to_target()` emits forward slashes for output
+   only. The checker flags string membership tests against path-shaped names.
+3. **Emoji to a cp1252 console.** The status lines (`🔎`, `✅`, `🚨`) raise
+   `UnicodeEncodeError` on `cmd.exe`, killing a run on a decoration. Every entry
+   point calls `store.use_utf8_stdout()` first. It is called from `__main__` blocks
+   rather than at import, because rebinding another program's stdout because it
+   imported you is rude.
+4. **Unclosed SQLite connections.** Unix happily deletes an open file; Windows keeps
+   a lock, so a leaked handle turns into a failure to reopen or delete the database.
+   Every connection is closed through a context manager, and `store.py`'s self-check
+   probes for live handles by trying to use them — a *closed* `Connection` is still a
+   `Connection` object, so identity is not the test.
+
+**Setup is the same three commands**, `py` instead of `python3` if that is your
+launcher:
+
+```
+pip install -r requirements.txt
+git clone --depth 1 https://github.com/yaml/pyyaml targets/pyyaml
+set GEMINI_API_KEY=...          # PowerShell: $env:GEMINI_API_KEY="..."
+```
+
+`git` must be on `PATH` — `realapp.py` shells out to it to revert injected faults, and
+`mcp_tools.line_history` uses it. Not verified on a real Windows machine yet; the
+checker encodes what is known to differ, not everything that could.

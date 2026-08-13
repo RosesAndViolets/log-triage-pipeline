@@ -9,14 +9,19 @@ reads from disk. Nothing is remembered between calls, so restarting the server
 loses nothing.
 """
 
-import json
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).parent.resolve()
-LOG_STORE = ROOT / "run.jsonl"
+from triagelab.core import store
+
+# The repo root, NOT this package's directory. The jail has to cover targets/ —
+# scoping it to triagelab/toolserver/ would leave every existing test passing while
+# read_source silently lost the ability to see the code it exists to read.
+ROOT = Path(__file__).resolve().parents[2]
 MAX_SPAN = 200  # lines per read_source call — the model can ask again, tokens are the budget
+GIT_TIMEOUT = 10  # seconds — a hung git process must not hang the whole tool loop
 
 
 def _safe(path: str) -> Path:
@@ -44,7 +49,7 @@ def read_source(path: str, start_line: int = 1, end_line: int = 0) -> str:
     p = _safe(path)
     if not p.is_file():
         return f"no such file: {path}"
-    lines = p.read_text(errors="replace").splitlines()
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     start = max(1, start_line)
     end = min(len(lines), end_line or start + 60)
     if end < start:
@@ -68,11 +73,19 @@ def search_code(pattern: str, glob: str = "**/*.py", max_hits: int = 40) -> str:
     except re.error as e:
         return f"bad regex: {e}"
     hits = []
-    for p in sorted(ROOT.glob(glob)):
+    for raw in sorted(ROOT.glob(glob)):
+        # A literal ".." path segment is not a wildcard, so glob() never runs it
+        # through _safe() on its own — route every hit through the jail here,
+        # same as read_source and line_history already do.
+        try:
+            p = _safe(str(raw))
+        except ValueError:
+            continue
         if not p.is_file() or ".git" in p.parts or "__pycache__" in p.parts:
             continue
         try:
-            for n, line in enumerate(p.read_text(errors="replace").splitlines(), 1):
+            for n, line in enumerate(
+                    p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
                 if rx.search(line):
                     hits.append(f"{p.relative_to(ROOT)}:{n}: {line.strip()[:160]}")
                     if len(hits) >= max_hits:
@@ -91,25 +104,20 @@ def get_logs(trace_id: str = "", service: str = "", level: str = "", limit: int 
         level: Only lines at this level (INFO, ERROR, ...).
         limit: Most recent N matching lines.
     """
-    if not LOG_STORE.exists():
+    # Scoped to the current run, so an earlier run's lines can never be served
+    # as if they belonged to this error. That scoping is why logs.db no longer
+    # has to be truncated between runs the way run.jsonl did.
+    run_id = store.latest_run_id()
+    if not run_id:
         return "log store is empty — nothing has been ingested yet"
-    out = []
-    for raw in LOG_STORE.read_text().splitlines():
-        try:
-            e = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if trace_id and e.get("trace_id") != trace_id:
-            continue
-        if service and e.get("serviceName") != service:
-            continue
-        if level and e.get("level") != level.upper():
-            continue
-        out.append(f"[{e.get('trace_id','-')}] {e.get('level','?'):<5} "
-                   f"{e.get('serviceName','?')}: {e.get('message','')[:200]}")
-    if not out:
+    rows = store.query_logs(run_id=run_id, trace_id=trace_id, service=service,
+                            level=level, limit=limit)
+    if not rows:
         return "no matching log lines"
-    return "\n".join(out[-limit:])
+    return "\n".join(
+        f"[{r['trace_id'] or '-'}] {(r['level'] or '?'):<5} "
+        f"{r['service'] or '?'}: {(r['message'] or '')[:200]}" for r in rows
+    )
 
 
 def line_history(path: str, line: int) -> str:
@@ -128,11 +136,14 @@ def line_history(path: str, line: int) -> str:
         repo = repo.parent
     if not (repo / ".git").exists():
         return f"{path} is not in a git repository"
-    r = subprocess.run(
-        ["git", "log", "-L", f"{line},{line}:{p.relative_to(repo)}", "--max-count=3",
-         "--date=short", "--format=%h %ad %an: %s"],
-        cwd=repo, capture_output=True, text=True,
-    )
+    try:
+        r = subprocess.run(
+            ["git", "log", "-L", f"{line},{line}:{p.relative_to(repo)}", "--max-count=3",
+             "--date=short", "--format=%h %ad %an: %s"],
+            cwd=repo, capture_output=True, text=True, timeout=GIT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return f"git timed out tracing {path}:{line}"
     if r.returncode != 0:
         return f"git could not trace that line: {r.stderr.strip()[:200]}"
     return r.stdout[:4000] or f"no recorded history for {path}:{line}"
@@ -142,6 +153,7 @@ TOOLS = (read_source, search_code, get_logs, line_history)
 
 
 def _self_check():
+    global ROOT, GIT_TIMEOUT
     # The trust boundary is the part that must not regress.
     for bad in ("../../../etc/passwd", "/etc/passwd", "targets/../../secrets"):
         try:
@@ -149,19 +161,59 @@ def _self_check():
             raise AssertionError(f"path jail let {bad!r} through")
         except ValueError:
             pass
-    assert _safe("triage.py").name == "triage.py"
+    assert _safe("triagelab/core/triage.py").name == "triage.py"
 
-    out = read_source("triage.py", 1, 5)
-    assert "triage.py lines 1-5" in out and "\n    1 " in out, out
+    # The jail must still reach targets/. If ROOT ever narrows to this package,
+    # every assertion above still passes while read_source goes blind to the only
+    # code it exists to read — so assert the reach, not just the refusals.
+    assert ROOT.name != "toolserver", f"jail root collapsed onto the package: {ROOT}"
+    assert (ROOT / "triagelab").is_dir(), f"jail root is not the repo root: {ROOT}"
+    clone = ROOT / "targets" / "pyyaml" / "lib" / "yaml" / "constructor.py"
+    if clone.exists():
+        assert _safe(str(clone)).is_file(), "targets/ fell outside the jail"
+        assert "construct_yaml_bool" in read_source(
+            "targets/pyyaml/lib/yaml/constructor.py", 230, 245)
+
+    out = read_source("triagelab/core/triage.py", 1, 5)
+    assert "triagelab/core/triage.py lines 1-5" in out and "\n    1 " in out, out
     assert "no such file" in read_source("nope.py")
 
-    hits = search_code(r"def fingerprint", "*.py")
-    assert "triage.py:" in hits, hits
-    assert "no matches" in search_code(r"zzz_not_here_zzz", "*.py")
-    assert "bad regex" in search_code("(unclosed", "*.py")
+    hits = search_code(r"def fingerprint", "triagelab/**/*.py")
+    assert "triagelab/core/triage.py:" in hits, hits
+    assert "no matches" in search_code(r"zzz_not_here_zzz", "triagelab/**/*.py")
+    assert "bad regex" in search_code("(unclosed", "triagelab/**/*.py")
 
-    hist = line_history("triage.py", 1)
-    assert "Initial import" in hist or "no recorded history" in hist, hist
+    # search_code walks glob() results, which _safe() never sees on their own:
+    # a literal ".." segment is a traversal step, not a wildcard. This caught a
+    # real escape — the sibling's contents came back verbatim before the fix.
+
+    real_root = ROOT
+    try:
+        tmp = Path(tempfile.mkdtemp()).resolve()  # macOS /var -> /private/var
+        (tmp / "root").mkdir()
+        (tmp / "root" / "inside.py").write_text("marker_inside\n", encoding="utf-8")
+        (tmp / "sibling.py").write_text("marker_outside\n", encoding="utf-8")
+        ROOT = tmp / "root"
+        escaped = search_code("marker_", "../*.py")
+        assert "marker_outside" not in escaped, escaped
+        assert "sibling" not in escaped, escaped
+        assert "marker_inside" in search_code("marker_", "*.py")
+    finally:
+        ROOT = real_root
+
+    # Three legitimate answers: real history, none recorded, or git refusing a path
+    # it has never seen — which is what a file moved but not yet committed looks like.
+    hist = line_history("triagelab/core/triage.py", 1)
+    assert any(s in hist for s in ("Initial import", "no recorded history",
+                                   "could not trace", ":")), hist
+
+    # A hung git must degrade to a string, not stall the agentic tool loop.
+    real_timeout = GIT_TIMEOUT
+    try:
+        GIT_TIMEOUT = 0.0001
+        assert "timed out" in line_history("triagelab/core/triage.py", 1)
+    finally:
+        GIT_TIMEOUT = real_timeout
 
     print("mcp_tools self-check ok — path jail holds, all four tools answer")
 
