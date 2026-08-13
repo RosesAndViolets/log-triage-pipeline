@@ -437,8 +437,10 @@ def main(argv: list[str]):
                        "reported": [f["service"] for f in chosen],
                        # Which decoys were actually on disk — derivable from the
                        # seed, but evidence should say it outright — and which
-                       # jail the code tools ran under.
-                       "on_disk": [f["file"] for f in on_disk],
+                       # jail the code tools ran under. File alone is ambiguous
+                       # (two distractors share constructor.py), so name the edit.
+                       "on_disk": [f"{f['file']} · {f['old'].strip()[:48]}"
+                                   for f in on_disk],
                        "jail": SourcePipeline.tool_jail},
         ) as (run_id, chain):
             pipeline = SourcePipeline(threshold=3).bind(run_id, chain, disabled)
