@@ -49,3 +49,19 @@ personal key isn't burned mid-refactor. Run cheapest-and-riskiest first.
 - None of section C has ground truth for the *distractor* claims — DISTRACTORS
   entries carry no `true_cause` by design, so grading there is eyeballed from
   `root_cause`/`proposed_fix` text, not the judge.
+
+## Limits that exist only because of the free tier — lift these on the work machine
+
+Every quota-driven limit is an environment variable, never a code constant, so
+lifting them on a machine with a paid key is configuration, not surgery. None
+of these numbers is a considered engineering choice; each was sized to
+20 req/day / 15 req/min and should be re-derived once quota is not the
+constraint.
+
+| Limit | Where | Free-tier value | With a paid key |
+|---|---|---|---|
+| Agentic tool budget | `TRIAGE_TOOL_BUDGET` env → `maximum_remote_calls` | 4 investigative calls (each is its own request) | raise to 10–15; watch whether more rounds actually improve `tool_hit`/fix score before going higher |
+| Request pacing | `TRIAGE_RPM_SLEEP` env (seconds between calls) | 4 (stays under 15/min) | `0` |
+| Model | `TRIAGE_MODEL` env | `gemini-3.1-flash-lite` (cheapest bucket) | pick by eval, not by price — run the same seed sweep on two models and compare |
+| One pick per run | interactive menu / `--pick` triages a single signature | a design choice *forced* by quota | keep the control, but batch mode (`triage everything hot`) becomes affordable again |
+| Judge is opt-in per verdict | grade prompt / `triage.judge` toggle | saves 1 req per skip | leave the judge on by default — graded runs are the only ones that teach anything |

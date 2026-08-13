@@ -40,12 +40,14 @@ def _launch(spec: dict) -> dict:
     if spec.get("agentic"):
         args.append("--agentic")
     if spec.get("pick"):
-        args += ["--pick", str(int(spec["pick"]))]
+        args += ["--pick", str(spec["pick"])]   # a number or a service name
     if spec.get("disable"):
         args += ["--disable", ",".join(spec["disable"])]
     for k in ("logged", "injected", "seed"):
         if spec.get(k) not in (None, ""):
             args += [f"--{k}", str(int(spec[k]))]
+    if harness == "real" and spec.get("fault"):
+        args += ["--fault", str(spec["fault"])]
 
     proc = subprocess.Popen(args, cwd=ROOT, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
@@ -87,6 +89,20 @@ class Handler(BaseHTTPRequestHandler):
                     "triage": [n.name for n in nodes.TRIAGE.order()],
                 })
 
+            if u.path == "/api/targets":
+                # Straight from the code that owns the faults: a future harness
+                # shows up in the UI by existing, not by editing the template.
+                from triagelab.harness import mockapp, realapp
+                # dict preserves insertion order and dedupes: two faults from
+                # one service are one dropdown entry, since service is the key
+                # a pick resolves by.
+                svcs = {f.service: None for f in mockapp.build_faults()}
+                return self._json({
+                    "mock": [{"service": s} for s in svcs],
+                    "real": [{"service": f["service"], "file": f["file"]}
+                             for f in realapp.FAULTS],
+                })
+
             if u.path == "/api/runs":
                 out = []
                 for r in store.list_runs(50):
@@ -120,6 +136,25 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:                     # a dev tool that dies is useless
             return self._json({"error": f"{type(e).__name__}: {e}"}, 500)
 
+    # --- DELETE ------------------------------------------------------------
+
+    def do_DELETE(self):
+        u = urlparse(self.path)
+        if not u.path.startswith("/api/run/"):
+            return self._json({"error": f"no route {u.path}"}, 404)
+        run_id = u.path[len("/api/run/"):]
+        with _lock:
+            proc = LIVE.get(run_id)
+        if proc and proc.poll() is None:
+            return self._json({"error": "run is still live — let it finish first"}, 409)
+        try:
+            n = store.delete_run(run_id)
+        except Exception as e:
+            return self._json({"error": f"{type(e).__name__}: {e}"}, 500)
+        with _lock:
+            LIVE.pop(run_id, None)
+        return self._json({"deleted": run_id, "events": n})
+
     # --- POST --------------------------------------------------------------
 
     def do_POST(self):
@@ -136,6 +171,20 @@ class Handler(BaseHTTPRequestHandler):
 
 def main(port: int = 8000):
     store.use_utf8_stdout()
+    # Runs launched from the page inherit this interpreter. Saying so up front
+    # beats a run that dies at triage.investigate with ModuleNotFoundError.
+    missing = []
+    for dep in ("mcp", "google.genai"):
+        try:
+            __import__(dep)
+        except ImportError:
+            missing.append(dep)
+    if missing:
+        print(f"  ⚠️  not importable with this interpreter: {', '.join(missing)}")
+        print(f"      {sys.executable}")
+        print("      browser-started runs use the same one — agentic runs and real"
+              " verdicts will fail.\n      start serve from the env that has the"
+              " deps (pip install -r requirements.txt).")
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"triage control surface  →  http://127.0.0.1:{port}")
     print("  start runs, watch the chain fill in, switch nodes off")
@@ -170,17 +219,20 @@ def _self_check():
         assert TEMPLATE.exists(), f"missing template: {TEMPLATE}"
         assert "ingest.gate" in nodes.ALL_NODES
 
-        # the launch argv must be exactly what a CLI user would have typed
-        spec = {"harness": "mock", "agentic": True, "pick": 2,
-                "disable": ["triage.judge"]}
-        argv = ["-m", "triagelab.harness.mockapp", "--no-self-check",
-                "--run-id", "X", "--agentic", "--pick", "2",
-                "--disable", "triage.judge"]
-        built = [sys.executable, "-m", "triagelab.harness.mockapp", "--no-self-check",
-                 "--run-id", "X"]
+        # the launch argv must be exactly what a CLI user would have typed —
+        # including a pick by service name and a named fault for the real harness
+        spec = {"harness": "real", "agentic": True, "pick": "feature-flags",
+                "fault": "feature-flags", "disable": ["triage.judge"], "injected": 3}
+        argv = ["-m", "triagelab.harness.realapp", "--no-self-check",
+                "--run-id", "X", "--agentic", "--pick", "feature-flags",
+                "--disable", "triage.judge", "--injected", "3",
+                "--fault", "feature-flags"]
+        built = [sys.executable, "-m", f"triagelab.harness.{spec['harness']}app",
+                 "--no-self-check", "--run-id", "X"]
         if spec["agentic"]:
             built.append("--agentic")
-        built += ["--pick", "2", "--disable", "triage.judge"]
+        built += ["--pick", str(spec["pick"]), "--disable", "triage.judge",
+                  "--injected", "3", "--fault", spec["fault"]]
         assert built[1:] == argv, built[1:]
 
         print("serve self-check ok — incremental tail, template present, "

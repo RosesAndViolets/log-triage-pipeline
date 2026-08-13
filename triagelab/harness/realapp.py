@@ -14,6 +14,7 @@ Run:
 import logging
 import random
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -100,17 +101,28 @@ DISTRACTORS = [
 ]
 
 
-def select(logged: int, injected: int, seed: int) -> tuple[list[dict], list[dict]]:
+def select(logged: int, injected: int, seed: int,
+           fault: str | None = None) -> tuple[list[dict], list[dict]]:
     """Choose which faults are reported (Y) and which are merely present (X).
 
     A fault that produced a log is by definition in the code, so the logged set is
     always a subset of the injected set. Remaining slots are filled with real faults
     that stayed silent first, then distractors — silent real bugs are the better
     decoys, because they are the same kind of thing as the answer.
+
+    `fault` names a specific fault to log instead of drawing by seed — how the
+    UI says "this run is about the feature-flags bug". Decoy fill is unchanged.
     """
     rng = random.Random(seed)
     pool = list(FAULTS)
     rng.shuffle(pool)
+    if fault is not None:
+        named = [f for f in pool if f["service"] == fault]
+        if not named:
+            raise SystemExit(f"--fault {fault!r}: no such fault. "
+                             f"One of: {', '.join(f['service'] for f in FAULTS)}")
+        pool = named + [f for f in pool if f["service"] != fault]
+        logged = max(logged, 1)   # naming a fault means logging it
     chosen = pool[:logged]
     rest = pool[logged:] + [d for d in DISTRACTORS]
     rng.shuffle(rest)
@@ -152,7 +164,16 @@ def rel_to_target(path: str) -> str:
 
 
 def fresh_yaml():
-    """Re-import the library from disk so the current injection is actually loaded."""
+    """Re-import the library from disk so the current injection is actually loaded.
+
+    The __pycache__ purge is load-bearing: pyc validity is source mtime (whole
+    seconds) + size, and the boolean fault is a same-size edit — rewrite the
+    file within the same second and the stale pyc of the *pristine* module
+    loads, so the fault silently never fires. git checkout does not remove
+    untracked __pycache__, which is how the staleness survives across runs.
+    """
+    for pyc in LIB.rglob("__pycache__"):
+        shutil.rmtree(pyc, ignore_errors=True)
     for name in [m for m in sys.modules if m == "yaml" or m.startswith("yaml.")]:
         del sys.modules[name]
     import yaml
@@ -186,6 +207,11 @@ def render_source(stack: str) -> str:
 
 class SourcePipeline(EvalPipeline):
     """Adds the real source behind the traceback to the LLM's context."""
+
+    # The agent investigates the target codebase, never the harness: FAULTS
+    # below holds the injection diffs and the true causes, and an unjailed
+    # search_code was observed returning it to the model mid-run.
+    tool_jail = "targets"
 
     def _fetch_context(self, log: dict) -> str:
         source = log["error"].get("source", "")
@@ -268,6 +294,29 @@ def _self_check():
         src = (TARGET / d["file"]).read_text(encoding="utf-8")
         assert src.count(d["old"]) == 1, f"distractor site not unique: {d['file']} {d['old']!r}"
 
+    # A same-size fault must survive a same-second rewrite. pyc validity is
+    # source mtime (whole seconds) + size; the boolean fault changes neither,
+    # so without fresh_yaml's __pycache__ purge the pristine module loads and
+    # the fault silently never fires — seen live as a run whose feature-flags
+    # service logged three INFO lines and no error at all.
+    import os
+    f_neutral = next(f for f in FAULTS if f["service"] == "feature-flags")
+    site = TARGET / f_neutral["file"]
+    before = site.stat()
+    fresh_yaml()                       # compile pycs for the pristine tree
+    try:
+        apply(f_neutral)
+        os.utime(site, (before.st_atime, before.st_mtime))   # same second, same size
+        y = fresh_yaml()
+        try:
+            y.safe_load(f_neutral["doc"])
+            raised = False
+        except Exception:
+            raised = True
+    finally:
+        revert()
+    assert raised, "stale __pycache__ hid a size-neutral fault"
+
     # Selection: logged is always a subset of injected, and seeds are reproducible.
     a_chosen, a_disk = select(1, 9, seed=7)
     b_chosen, b_disk = select(1, 9, seed=7)
@@ -276,6 +325,17 @@ def _self_check():
     seeds = {select(1, 3, s)[0][0]["service"] for s in range(12)}
     assert len(seeds) > 1, f"seed changes nothing: {seeds}"
     assert select(1, 0, 0)[1] == [], "--injected 0 must leave the clone pristine"
+
+    # A named fault must be the logged one regardless of seed, decoys unchanged.
+    for s in range(3):
+        f_chosen, f_disk = select(1, 3, s, fault="manifest-parser")
+        assert f_chosen[0]["service"] == "manifest-parser", f_chosen
+        assert f_chosen[0] in f_disk and len(f_disk) == 3, f_disk
+    try:
+        select(1, 3, 0, fault="no-such-service")
+        raise AssertionError("unknown --fault was accepted")
+    except SystemExit:
+        pass
 
     mockapp.reset()
     p = SourcePipeline(threshold=3)
@@ -291,6 +351,9 @@ def _self_check():
     assert "constructor.py" in ctx, ctx[:400]
     assert "bool_values[value.upper()]" in ctx, ctx[:400]  # the injected line itself
 
+    # The real harness always jails the agent's code tools to the target.
+    assert SourcePipeline.tool_jail == "targets", SourcePipeline.tool_jail
+
     # Retrieval must be evaluatable, not just present: the meta names the files,
     # and the fault's own file is the ground truth the judge node checks against.
     tf = p.truth_file(p.samples[fp])
@@ -300,18 +363,28 @@ def _self_check():
     assert p.last_context_meta["log_lines"] > 0, p.last_context_meta
 
     # End to end, no API key: a stub run must land a component event on the
-    # chain saying whether retrieval reached the faulty file.
-    mockapp.reset()
-    with store.open_run(model="test", mode="stub", run_id="rc1") as (rid, chain):
-        p2 = SourcePipeline(threshold=3).bind(rid, chain)
-        p2.client = None
-        exercise(p2)
-        p2.run(interactive=False, agentic=False, pick=1)
-    ev = store.load_run("rc1")["events"]
-    comp = [e for e in ev if e["node"] == "triage.judge" and e["kind"] == "component"]
-    assert comp, "no component event — retrieval was never evaluated"
-    cp = comp[0]["payload"]
-    assert cp["context_hit"] is True, cp  # its own traceback names its own file
+    # chain saying whether retrieval reached the faulty file. In a temp store —
+    # a self-check must not leave its scaffolding in the real run picker.
+    import shutil as _sh
+    import tempfile
+    real_dbs = (store.LOGS_DB, store.RUNS_DB)
+    tmp = Path(tempfile.mkdtemp())
+    store.LOGS_DB, store.RUNS_DB = tmp / "l.db", tmp / "r.db"
+    try:
+        mockapp.reset()
+        with store.open_run(model="test", mode="stub", run_id="rc1") as (rid, chain):
+            p2 = SourcePipeline(threshold=3).bind(rid, chain)
+            p2.client = None
+            exercise(p2)
+            p2.run(interactive=False, agentic=False, pick=1)
+        ev = store.load_run("rc1")["events"]
+        comp = [e for e in ev if e["node"] == "triage.judge" and e["kind"] == "component"]
+        assert comp, "no component event — retrieval was never evaluated"
+        cp = comp[0]["payload"]
+        assert cp["context_hit"] is True, cp  # its own traceback names its own file
+    finally:
+        store.LOGS_DB, store.RUNS_DB = real_dbs
+        _sh.rmtree(tmp, ignore_errors=True)
 
     # Faults must be isolated: identical exception classes everywhere means one
     # fault is masking the others (the scanner injection does exactly that).
@@ -335,9 +408,20 @@ def main(argv: list[str]):
 
     try:
         logged, injected, seed = _args(argv)
-        chosen, on_disk = select(logged, injected, seed)
         agentic = "--agentic" in argv
-        pick = int(opt("--pick", 0)) or None
+        raw_pick = opt("--pick", "")
+        pick = (int(raw_pick) if raw_pick.isdigit() else raw_pick) or None
+        fault = opt("--fault")   # inject a *named* fault instead of a seeded draw
+        if fault:
+            # Naming a fault means the run is about it: log only it unless the
+            # experiment says otherwise, and triage it without a separate --pick.
+            if "--logged" not in argv:
+                logged = 1
+                if "--injected" not in argv:
+                    injected = 1
+            if pick is None:
+                pick = fault
+        chosen, on_disk = select(logged, injected, seed, fault=fault)
         disabled = frozenset(a for a in opt("--disable", "").split(",") if a)
         # The server picks the id up front so it can poll before we open the run.
         run_id_in = opt("--run-id", "")
@@ -348,8 +432,14 @@ def main(argv: list[str]):
         with store.open_run(
             model=triage.MODEL, mode="agentic" if agentic else "push", run_id=run_id_in,
             condition={"harness": "real", "logged": logged, "injected": injected,
-                       "seed": seed, "pick": pick, "disabled": sorted(disabled),
-                       "reported": [f["service"] for f in chosen]},
+                       "seed": seed, "pick": pick, "fault": fault,
+                       "disabled": sorted(disabled),
+                       "reported": [f["service"] for f in chosen],
+                       # Which decoys were actually on disk — derivable from the
+                       # seed, but evidence should say it outright — and which
+                       # jail the code tools ran under.
+                       "on_disk": [f["file"] for f in on_disk],
+                       "jail": SourcePipeline.tool_jail},
         ) as (run_id, chain):
             pipeline = SourcePipeline(threshold=3).bind(run_id, chain, disabled)
             exercise(pipeline, faults=chosen)

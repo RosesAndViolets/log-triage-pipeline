@@ -9,6 +9,7 @@ reads from disk. Nothing is remembered between calls, so restarting the server
 loses nothing.
 """
 
+import os
 import re
 import subprocess
 import tempfile
@@ -24,6 +25,19 @@ MAX_SPAN = 200  # lines per read_source call — the model can ask again, tokens
 GIT_TIMEOUT = 10  # seconds — a hung git process must not hang the whole tool loop
 
 
+def _jail() -> Path:
+    """Where tool calls are confined. Defaults to the repo root.
+
+    TRIAGE_TOOL_JAIL narrows it below the root — the real harness sets it to
+    "targets", because its FAULTS table holds the injection diffs and the
+    ground-truth text, and search_code('bool_values') was observed live
+    returning that answer sheet to the agent mid-run. Read per call so the
+    server needs no restart to change rules between runs.
+    """
+    sub = os.getenv("TRIAGE_TOOL_JAIL", "")
+    return (ROOT / sub).resolve() if sub else ROOT
+
+
 def _safe(path: str) -> Path:
     """Resolve a model-supplied path, or refuse.
 
@@ -35,6 +49,9 @@ def _safe(path: str) -> Path:
     p = (ROOT / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
     if not p.is_relative_to(ROOT):
         raise ValueError(f"path escapes the repo root: {path}")
+    jail = _jail()
+    if jail != ROOT and not p.is_relative_to(jail):
+        raise ValueError(f"path is outside this run's tool jail ({jail.name}/): {path}")
     return p
 
 
@@ -173,6 +190,24 @@ def _self_check():
         assert _safe(str(clone)).is_file(), "targets/ fell outside the jail"
         assert "construct_yaml_bool" in read_source(
             "targets/pyyaml/lib/yaml/constructor.py", 230, 245)
+
+    # The narrowed jail: a real-harness run must not be able to read the answer
+    # sheet. This is the exact leak observed live — search_code('bool_values')
+    # returned realapp.py's FAULTS table, injection diff and truth text included.
+    os.environ["TRIAGE_TOOL_JAIL"] = "targets"
+    try:
+        try:
+            _safe("triagelab/harness/realapp.py")
+            raise AssertionError("the jail let the harness's FAULTS table through")
+        except ValueError:
+            pass
+        if clone.exists():
+            assert _safe("targets/pyyaml/lib/yaml/constructor.py").is_file()
+            leak = search_code("bool_values", "**/*.py")
+            assert "realapp.py" not in leak, leak[:300]
+            assert "constructor.py" in leak, leak[:300]
+    finally:
+        del os.environ["TRIAGE_TOOL_JAIL"]
 
     out = read_source("triagelab/core/triage.py", 1, 5)
     assert "triagelab/core/triage.py lines 1-5" in out and "\n    1 " in out, out

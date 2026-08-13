@@ -2,9 +2,9 @@
 """The one command you invoke. Everything else is a subcommand of this.
 
     python run.py check                          verify the wiring (no API key)
-    python run.py mock   [--agentic] [--pick N] [--disable NODE,NODE]
-    python run.py real   [--agentic] [--logged Y --injected X --seed N] [--pick N]
-    python run.py runs                           what has been recorded
+    python run.py mock   [--agentic] [--pick N|SERVICE] [--disable NODE,NODE]
+    python run.py real   [--agentic] [--fault SERVICE] [--logged Y --injected X --seed N] [--pick N|SERVICE]
+    python run.py runs [--delete ID | --clear]   what has been recorded
     python run.py export [--run ID] [--out FILE] one run -> a standalone page
     python run.py serve  [--port 8000]           drive the pipeline from a browser
 
@@ -37,6 +37,7 @@ def cmd_check(argv):
         "triagelab.toolserver.tools",
         "triagelab.core.triage",
         "triagelab.viewer.export_run",
+        "triagelab.viewer.serve",
         "triagelab.harness.mockapp",
         "triagelab.harness.realapp",
     ]
@@ -82,19 +83,31 @@ def cmd_real(argv):
 
 
 def cmd_runs(argv):
+    if "--delete" in argv:
+        rid = argv[argv.index("--delete") + 1]
+        n = store.delete_run(rid)
+        print(f"deleted {rid} — {n} events removed from runs.db, logs cleared"
+              if n else f"no such run: {rid}")
+        return 0
+    if "--clear" in argv:
+        runs = store.list_runs(10000)
+        for r in runs:
+            store.delete_run(r["run_id"])
+        print(f"cleared {len(runs)} run(s) from both databases")
+        return 0
     runs = store.list_runs()
     if not runs:
         print("no runs yet — try:  python run.py mock --pick 1")
         return 0
-    print(f"{'run_id':<18} {'what it triaged':<34} {'mode':<8} {'ev':>5}  "
-          f"{'chain':<7} status")
+    print(f"{'run_id':<18} {'harness':<8} {'what it triaged':<34} {'mode':<8} "
+          f"{'ev':>5}  {'chain':<7} status")
     for r in runs:
         cond = r.get("condition") or {}
         off = len(cond.get("disabled") or [])
         ok = "ok" if store.verify(r["run_id"]) is None else "BROKEN"
         label = r["label"] + (f"  ({off} off)" if off else "")
-        print(f"{r['run_id']:<18} {label:<34} {r['mode']:<8} {r['events']:>5}  "
-              f"{ok:<7} {r['status']}")
+        print(f"{r['run_id']:<18} {cond.get('harness') or '?':<8} {label:<34} "
+              f"{r['mode']:<8} {r['events']:>5}  {ok:<7} {r['status']}")
     return 0
 
 

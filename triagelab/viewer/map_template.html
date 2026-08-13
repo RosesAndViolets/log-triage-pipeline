@@ -198,21 +198,29 @@ body.live .ctl { display:flex; }
   <label>Mode
     <select id="c-mode"><option value="push">push</option><option value="agentic">agentic</option></select>
   </label>
-  <label>Triage signature #
-    <input id="c-pick" type="number" min="1" max="9" value="1">
+  <label>Error
+    <select id="c-pick"></select>
   </label>
-  <label id="c-noisewrap" style="display:none">Injected / seed
+  <label id="c-noisewrap" style="display:none">Distractors / seed
     <span style="display:flex;gap:6px">
-      <input id="c-injected" type="number" min="0" max="9" value="3" title="bugs on disk">
-      <input id="c-seed" type="number" min="0" value="0" title="seed">
+      <input id="c-distractors" type="number" min="0" max="8" value="2"
+             title="silent unlogged bugs left in the code beside the named fault">
+      <input id="c-seed" type="number" min="0" value="0" title="which decoys fill the slots — same seed, same board">
     </span>
+  </label>
+  <label id="c-pristinewrap" style="display:none"
+         title="Nothing on disk at triage time — the error was logged, but the code the model reads is clean. False-positive control: does it hallucinate a defect?">Pristine
+    <input id="c-pristine" type="checkbox" style="margin-top:8px">
   </label>
   <label style="flex:1 1 320px">Switch nodes off for this run
     <div class="nodesoff" id="c-nodes"></div>
   </label>
   <button class="go2" id="c-start">Start run</button>
   <label class="runsel">Watching
-    <select id="c-runs"></select>
+    <span style="display:flex;gap:6px">
+      <select id="c-runs"></select>
+      <button id="c-del" title="Delete the watched run from both databases">Delete</button>
+    </span>
   </label>
 </div>
 
@@ -354,8 +362,11 @@ const WIRES = [
 const TOOLS = ["get_logs","read_source","search_code","line_history"];
 
 /* Which fixture a tool call reaches for, so the agent sprite has somewhere to go. */
-const TOOL_TARGET = {get_logs:"logsdb", read_source:"source",
-                     search_code:"source", line_history:"source"};
+/* No per-tool destination table: every call goes agent → mcp_server over
+   stdio, and read_source/search_code are jailed to the repo root, not to
+   targets/ — a table keyed on tool name was showing the agent somewhere it
+   never went. The truthful position is the mcp box; the argument says what
+   was actually fetched. */
 
 /* ============================================================
    Derive the replay from the chain. One step per recorded event,
@@ -409,10 +420,12 @@ function deriveSteps(run) {
       note = `${p.service || "?"} · ${p.message || ""} — kept as context, never triaged.`;
     }
     if (e.kind === "tool") {
-      head = `Tool · ${p.name}`;
-      note = `${p.name}(${JSON.stringify(p.args || {}).slice(1, -1)}) — the agent asked for this; nobody packed it into the prompt.`;
-      agent = TOOL_TARGET[p.name] || "mcp";
-      data = [{l: p.name, at: "triage.investigate"}];
+      const arg = (p.args && (p.args.path || p.args.pattern || p.args.query)) || "";
+      head = `Tool · ${p.name}` + (arg ? ` — ${arg}` : "");
+      note = `${p.name}(${JSON.stringify(p.args || {}).slice(1, -1)}) — asked over stdio to the MCP server; nobody packed this into the prompt. The result is in the panel below.`;
+      agent = "mcp";
+      data = [{l: p.name + (arg ? " · " + String(arg).split("/").pop() : ""),
+               at: "triage.investigate"}];
     }
     if (e.kind === "verdict") { head = "Verdict recorded"; note = p.root_cause || ""; }
     if (e.kind === "grade")   { head = "Graded against truth"; note = p.reasoning || ""; }
@@ -438,7 +451,8 @@ let FOCUS = "";                  // "" = everything; otherwise a fingerprint
 
 /* Ground truth and results come from the run too, not from this file. */
 let TRUTH = (RUN && RUN.truth) || {loc:"—", was:"", now:"", cause:
-  "No run loaded. This is the template — run export_run.py to fill it.", hid:""};
+  "No run loaded yet — pick one under Watching, or press Start run. "
+  + "(For a standalone page: python run.py export --run <id>)", hid:""};
 
 let RESULTS = (RUN && RUN.results) || [];
 
@@ -725,7 +739,7 @@ function paint(anim = true) {
   const io = $("#io"); io.innerHTML = "";
   (s.io || []).slice(0, 8).forEach(([k, v]) => {
     const dt = document.createElement("dt"); dt.textContent = k;
-    const dd = document.createElement("dd"); dd.textContent = v.length > 300 ? v.slice(0,300)+"…" : v;
+    const dd = document.createElement("dd"); dd.textContent = v.length > 600 ? v.slice(0,600)+"…" : v;
     io.appendChild(dt); io.appendChild(dd);
   });
 
@@ -817,11 +831,16 @@ document.addEventListener("keydown", e => {
   row.appendChild(d); $("#legend").appendChild(row);
 });
 
+/* Called at load AND from rebuild(): the truth panel used to be painted once,
+   so the live page kept showing the template placeholder after a run loaded. */
+function renderTruth() {
 $("#t-loc").textContent = TRUTH.loc || "—";
 $("#t-cause").textContent = TRUTH.cause || "";
 $("#t-hid").textContent = TRUTH.hid || "";
 $("#t-diff").innerHTML = TRUTH.was
   ? `<s>${TRUTH.was}</s> &nbsp;→&nbsp; <b>${TRUTH.now}</b>` : "";
+}
+renderTruth();
 
 /* The provenance line: which run this is, and whether it can be trusted. */
 if (RUN) {
@@ -843,7 +862,7 @@ if (RUN) {
   $("#chrome-prov").appendChild(bar);
 } else {
   $("#now").innerHTML = "<b>No run loaded.</b> This is the template. "
-    + "Run <code>python export_run.py --run &lt;id&gt; --out map.html</code> to fill it "
+    + "Run <code>python run.py export --run &lt;id&gt;</code> to fill it "
     + "from a real run in runs.db.";
 }
 
@@ -855,6 +874,7 @@ go(0, false);
 function rebuild(run) {
   RUN = run;
   TRUTH = (run && run.truth) || TRUTH;
+  renderTruth();
   RESULTS = (run && run.results) || [];
   ALL = deriveSteps(run);
   const keep = FOCUS;
@@ -916,8 +936,9 @@ async function loadRuns(select) {
     const o = document.createElement("option");
     o.value = r.run_id;
     const off = ((r.condition || {}).disabled || []).length;
+    const hz = (r.condition || {}).harness || "?";
     const t = r.run_id.slice(9, 11) + ":" + r.run_id.slice(11, 13) + ":" + r.run_id.slice(13, 15);
-    o.textContent = `${t} · ${r.label || "?"} · ${r.mode}`
+    o.textContent = `${t} · ${hz} · ${r.label || "?"} · ${r.mode}`
       + (off ? ` · ${off} off` : "") + (r.status && r.status.startsWith("failed") ? " · FAILED" : "")
       + (r.live ? " · ●live" : "");
     sel.appendChild(o);
@@ -971,14 +992,20 @@ async function startRun() {
   try {
     const disable = [...document.querySelectorAll("#c-nodes input:checked")]
       .map(i => i.value);
+    const err = $("#c-pick").value || null;   // a service name, resolved by run()
     const spec = {
       harness: $("#c-harness").value,
       agentic: $("#c-mode").value === "agentic",
-      pick: Number($("#c-pick").value) || null,
+      pick: err,
       disable,
     };
     if (spec.harness === "real") {
-      spec.injected = Number($("#c-injected").value);
+      spec.fault = err;                       // real also *injects* the named fault
+      // The CLI's --injected counts everything on disk including the fault;
+      // the UI speaks in distractors (decoys beyond it). Pristine = nothing on
+      // disk at all — the false-positive control.
+      spec.injected = $("#c-pristine").checked
+        ? 0 : 1 + Number($("#c-distractors").value);
       spec.seed = Number($("#c-seed").value);
     }
     const r = await api("/api/start", {method:"POST", headers:{"Content-Type":"application/json"},
@@ -1008,10 +1035,63 @@ if (LIVE) {
       w.appendChild(cb); w.appendChild(lb); box.appendChild(w);
     });
   });
+  // The Error dropdown lists each harness's faults, straight from the code
+  // that owns them — picking one is what the run is about. In mock it chooses
+  // which signature gets triaged (the stream still carries all services); in
+  // real it also chooses which fault is injected into the clone.
+  let TARGETS = {};
+  function fillErrors(harness) {
+    const sel = $("#c-pick"); sel.innerHTML = "";
+    (TARGETS[harness] || []).forEach(f => {
+      const o = document.createElement("option");
+      o.value = f.service;
+      o.textContent = f.service + (f.file ? " · " + f.file.split("/").pop() : "");
+      sel.appendChild(o);
+    });
+  }
+  api("/api/targets").then(t => { TARGETS = t; fillErrors($("#c-harness").value); });
+
   $("#c-start").onclick = startRun;
   $("#c-runs").onchange = e => { clearTimeout(timer); watch(e.target.value); };
-  $("#c-harness").onchange = e =>
-    $("#c-noisewrap").style.display = e.target.value === "real" ? "flex" : "none";
+
+  // Two clicks to delete: the first arms, the second (within 2.5s) fires.
+  // No confirm() popup — a native dialog blocks the whole page.
+  let delArmed = 0;
+  $("#c-del").onclick = async () => {
+    const rid = $("#c-runs").value, b = $("#c-del");
+    if (!rid) return;
+    if (Date.now() - delArmed > 2500) {
+      delArmed = Date.now();
+      b.textContent = "Sure?";
+      setTimeout(() => { b.textContent = "Delete"; }, 2500);
+      return;
+    }
+    b.disabled = true;
+    try {
+      const r = await api("/api/run/" + rid, {method: "DELETE"});
+      if (r.error) throw new Error(r.error);
+      clearTimeout(timer);
+      watching = null; seen = -1; events = [];
+      const runs = await api("/api/runs");
+      if (!runs.length) { location.reload(); return; }
+      await loadRuns();               // falls through to watching the latest
+    } catch (e) {
+      b.textContent = "✗ " + e.message.slice(0, 30);
+      setTimeout(() => { b.textContent = "Delete"; }, 3000);
+    } finally {
+      b.disabled = false; delArmed = 0;
+      if (b.textContent === "Sure?") b.textContent = "Delete";
+    }
+  };
+  $("#c-harness").onchange = e => {
+    const real = e.target.value === "real" ? "flex" : "none";
+    $("#c-noisewrap").style.display = real;
+    $("#c-pristinewrap").style.display = real;
+    fillErrors(e.target.value);
+  };
+  // Pristine means zero on disk — a distractor count would be a contradiction.
+  $("#c-pristine").onchange = e =>
+    $("#c-distractors").disabled = e.target.checked;
   // Any manual navigation stops the view chasing the tail.
   ["#next","#prev","#reset","#play"].forEach(id =>
     $(id).addEventListener("click", () => { follow = false; }, true));

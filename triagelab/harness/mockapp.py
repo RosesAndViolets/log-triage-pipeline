@@ -4,6 +4,15 @@ Raises real exceptions, logs them through stdlib logging, and keeps the true cau
 of each injected fault in a side channel the pipeline never sees. Then grades the
 pipeline's verdict against that truth with an LLM judge.
 
+Known leak, kept deliberately: in agentic mode the code tools are jailed to the
+repo root, and for mock errors the "source code" behind the traceback is THIS
+file — so the agent can read the simulation script and conclude the fault is
+intentional (observed live: search_code('fetch_user_profile') → this module →
+confidence 1.0, "intentionally configured"). Mock+agentic measures tool use,
+not diagnosis; the honest diagnosis experiment is the real harness, whose runs
+jail the code tools to targets/ (TRIAGE_TOOL_JAIL) precisely so its FAULTS
+table cannot leak the same way.
+
 Run:  python mockapp.py
 """
 
@@ -395,6 +404,18 @@ def _self_check():
             other = "ingest.fingerprint" if node.startswith("ingest") else "triage.route"
             assert any(e["node"] == other and e["kind"] == "exit" for e in ev), \
                 f"nothing ran at all with {node} off — the graph died rather than skipped"
+
+        # A pick by service name must land on that service's signature — the UI
+        # sends names, because a menu index says nothing before the run exists.
+        reset()
+        with store.open_run(model="test", mode="stub", run_id="sc4") as (rid, ch):
+            p3 = EvalPipeline(threshold=3).bind(rid, ch)
+            p3.client = None
+            simulate(p3)
+            p3.run(interactive=False, agentic=False, pick="checkout-api")
+        sel = [e for e in store.load_run("sc4")["events"]
+               if e["node"] == "triage.select" and e["kind"] == "exit"]
+        assert sel and sel[0]["payload"]["service"] == "checkout-api", sel[:1]
     finally:
         store.LOGS_DB, store.RUNS_DB = real
         shutil.rmtree(tmp, ignore_errors=True)
@@ -409,7 +430,8 @@ def main(argv: list[str]):
         return argv[argv.index(name) + 1] if name in argv else default
 
     agentic = "--agentic" in argv
-    pick = int(opt("--pick", 0)) or None
+    raw_pick = opt("--pick", "")
+    pick = (int(raw_pick) if raw_pick.isdigit() else raw_pick) or None
     disabled = frozenset(a for a in opt("--disable", "").split(",") if a)
     # The server picks the id up front so it can poll before we open the run.
     run_id_in = opt("--run-id", "")

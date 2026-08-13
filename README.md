@@ -67,8 +67,9 @@ Flags that apply to both harnesses:
 | Flag | Means |
 |---|---|
 | `--agentic` | The model fetches its own context through the MCP tools, instead of being handed a packet. |
-| `--pick N` | Triage the Nth signature over threshold, no prompt. Without it you get the menu. |
+| `--pick N` | Triage the Nth signature over threshold, no prompt. Without it you get the menu. A service name works too: `--pick checkout-api`. |
 | `--disable NODE,NODE` | Switch DAG nodes off for this run. Recorded with the run. |
+| `--fault SERVICE` | `real` only — inject and triage that named fault instead of a seeded draw (e.g. `--fault feature-flags`). |
 | `--logged Y --injected X --seed N` | `real` only — the noise experiment. See below. |
 
 ### Driving it from the browser
@@ -79,7 +80,9 @@ python run.py serve          # → http://127.0.0.1:8000
 
 The page is the system map, live. You can:
 
-- **start a run** — pick the harness, push or agentic, and which signature to triage;
+- **start a run** — pick the harness, push or agentic, and which error it is about
+  (in `mock` that chooses what gets triaged; in `real` it also chooses which fault
+  is injected into the clone);
 - **watch the chain fill in** as it happens, node by node, rather than after the fact;
 - **switch nodes off** with the checkboxes, per run;
 - **scrub back** through any earlier run from the dropdown.

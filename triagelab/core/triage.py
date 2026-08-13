@@ -17,7 +17,10 @@ from pydantic import BaseModel, Field, model_validator
 # Free tier is 20 requests/day PER MODEL, so the model you pick is a budget choice.
 # Override for a stronger verdict: TRIAGE_MODEL=gemini-3.6-flash python mockapp.py
 MODEL = os.getenv("TRIAGE_MODEL", "gemini-3.1-flash-lite")
-RPM_SLEEP = 4  # base pacing for the free tier; the client's retry_options absorb the rest
+# Base pacing for the free tier (15 req/min); the client's retry_options absorb
+# the rest. On a paid key: TRIAGE_RPM_SLEEP=0. Quota limits live in env vars,
+# never in code, so the work machine lifts them without an edit.
+RPM_SLEEP = float(os.getenv("TRIAGE_RPM_SLEEP", "4"))
 # Each tool round-trip is its own API request, so this is a budget, not a timeout.
 AGENTIC_TOOL_BUDGET = int(os.getenv("TRIAGE_TOOL_BUDGET", "4"))
 
@@ -55,6 +58,12 @@ def fingerprint(log: dict) -> str:
 
 
 class TriagePipeline:
+    # Where the agentic code tools may look. "" = the whole repo root; the real
+    # harness narrows this to "targets" so the agent can never search the
+    # harness's own FAULTS table — the answer sheet. Class attribute so a
+    # subclass can override it without fighting __init__.
+    tool_jail = ""
+
     def __init__(self, threshold: int = 3):
         self.threshold = threshold
         self.agentic = False
@@ -107,12 +116,14 @@ class TriagePipeline:
             self.samples.setdefault(fp, log)
 
     def run(self, interactive: bool = False, agentic: bool = False,
-            pick: int | None = None):
+            pick: int | str | None = None):
         """Stage 3 & 4: LLM triage loop, then routing.
 
         `pick` triages the Nth hot signature (1-indexed) with no prompt. A run
         started by the server has no tty, so without this it would ingest and
-        then decline to triage anything at all.
+        then decline to triage anything at all. A service name works too, and
+        is resolved here — the only place the hot list exists — so a UI can say
+        "the checkout-api error" without guessing at menu order.
 
         Note there is no `disabled` argument: it belongs to bind(), because by
         the time this is called the ingest graph has already run.
@@ -123,6 +134,14 @@ class TriagePipeline:
         print(
             f"\n{len(self.counts)} unique signatures, {len(hot)} over threshold ({self.threshold}).\n"
         )
+        if isinstance(pick, str):
+            byname = [i for i, fp in enumerate(hot, 1)
+                      if self.samples[fp]["serviceName"] == pick]
+            if not byname:
+                print(f"   ⚠️  --pick {pick!r}: no hot signature from that service "
+                      f"({', '.join(self.samples[fp]['serviceName'] for fp in hot) or 'none'})")
+                return
+            pick = byname[0]
         if pick is not None:
             if not 1 <= pick <= len(hot):
                 print(f"   ⚠️  --pick {pick} is out of range: {len(hot)} over threshold")
@@ -288,10 +307,15 @@ class TriagePipeline:
         # needs the repo root importable. cwd anchors that on Windows too, where a
         # bare script path would not resolve the package at all.
         repo_root = Path(__file__).resolve().parents[2]
+        # env must be passed explicitly: MCP's default environment strips
+        # custom variables, and the jail has to survive into the subprocess.
+        from mcp.client.stdio import get_default_environment
         params = StdioServerParameters(
             command=sys.executable,
             args=["-m", "triagelab.toolserver.server"],
             cwd=str(repo_root),
+            env={**get_default_environment(), "TRIAGE_TOOL_JAIL": self.tool_jail}
+                if self.tool_jail else None,
         )
         # errlog to devnull: the server logs every request to stderr, which is noise
         # in front of a verdict. The tool calls are printed below instead.
@@ -349,6 +373,12 @@ class TriagePipeline:
                     rec = pending.get(fr.name)
                     if rec is not None:
                         out = (fr.response or {}).get("result", fr.response)
+                        # An MCP tool answers with a CallToolResult, whose str()
+                        # is an object repr. The text inside is the evidence —
+                        # the thing the replay needs to show — so unwrap it.
+                        content = getattr(out, "content", None)
+                        if isinstance(content, list):
+                            out = "\n".join(getattr(c, "text", str(c)) for c in content)
                         rec["result"] = str(out)[:1500]
 
     def _fallback(self, resp) -> TriageVerdict:
@@ -482,6 +512,20 @@ def _self_check():
     assert p.chain is None and p.run_id == ""
     p.bind("r1", object())
     assert p.run_id == "r1" and p.chain is not None
+
+    # Tool results must be recorded as their text, not as an object repr —
+    # the replay's "what did read_source actually read" panel depends on it.
+    from types import SimpleNamespace as NS
+    call = NS(name="read_source", args={"path": "x.py"})
+    mcpish = NS(content=[NS(text="line one"), NS(text="line two")])
+    resp = NS(automatic_function_calling_history=[
+        NS(parts=[NS(function_call=call, function_response=None)]),
+        NS(parts=[NS(function_call=None,
+                     function_response=NS(name="read_source",
+                                          response={"result": mcpish}))]),
+    ])
+    p._print_tool_calls(resp)
+    assert p.last_tool_calls[0]["result"] == "line one\nline two", p.last_tool_calls
     print("self-check ok")
 
 

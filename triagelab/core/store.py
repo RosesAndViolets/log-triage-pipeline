@@ -139,6 +139,24 @@ def latest_run_id() -> str:
     return r["run_id"] if r else ""
 
 
+def delete_run(run_id: str) -> int:
+    """Remove one run and everything recorded under it, from both databases.
+
+    Whole runs only: the chain stays tamper-evident because deleting a run
+    leaves no partial history to lie with — verify() is per run, and a run
+    that is gone is visibly gone from the picker rather than subtly edited.
+    Returns the number of events removed.
+    """
+    with runs_db() as c:
+        n = c.execute("DELETE FROM event WHERE run_id=?", (run_id,)).rowcount
+        c.execute("DELETE FROM run WHERE run_id=?", (run_id,))
+        c.commit()
+    with logs_db() as c:
+        c.execute("DELETE FROM log WHERE run_id=?", (run_id,))
+        c.commit()
+    return n
+
+
 # --- the evidence chain ----------------------------------------------------
 
 
@@ -356,6 +374,13 @@ def _self_check():
         with runs_db() as c:
             c.execute("DELETE FROM event WHERE run_id=? AND seq=0", (rid,))
         assert verify(rid) == 1, "a gap should break the chain"
+
+        # delete_run removes the whole run from BOTH databases, and only it
+        n = delete_run(r2)
+        assert n == 1, n
+        assert latest_run_id() != r2 and query_logs(run_id=r2) == [], \
+            "run2 should be gone from runs.db and logs.db"
+        assert query_logs(run_id=rid), "deleting run2 must not touch run1's logs"
 
         # Leaked connections are a Windows bug that macOS hides: Unix happily
         # deletes an open file, Windows refuses. So probe live handles directly
