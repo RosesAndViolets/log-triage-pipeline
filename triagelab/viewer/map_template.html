@@ -222,6 +222,9 @@ body.live .ctl { display:flex; }
       <button id="c-del" title="Delete the watched run from both databases">Delete</button>
     </span>
   </label>
+  <label>Language / 言語
+    <button id="c-lang" title="Switch display language / 表示言語を切り替え">EN / 日本語</button>
+  </label>
 </div>
 
 <div class="bar">
@@ -369,6 +372,125 @@ const TOOLS = ["get_logs","read_source","search_code","line_history"];
    was actually fetched. */
 
 /* ============================================================
+   Display language. English is authoritative — every lookup falls back to
+   it, so a missing translation can only ever show English, never break.
+   Toggling reloads the page: one rendering path, not two.
+   Keywords stay English everywhere: node names, service names, code, paths.
+   ============================================================ */
+const LANG = (() => { try { return localStorage.getItem("triage-lang") || "en"; }
+                      catch (e) { return "en"; } })();
+
+const JA = {
+  /* step phrases */
+  " — skipped": "（スキップ）",
+  " — failed": "（失敗）",
+  "This path was not taken: ": "この経路は実行されなかった：",
+  "switched off": "スイッチで無効化",
+  "condition not met": "条件を満たさず",
+  "turned away at the gate": "はゲートで却下",
+  "kept as context, never triaged.": "コンテキストとして保持、トリアージはされない。",
+  "asked over stdio to the MCP server; nobody packed this into the prompt. The result is in the panel below.":
+    "stdio 経由で MCP サーバーへ要求。プロンプトに詰め込まれたのではなく、エージェント自身が求めた。結果は下のパネルに。",
+  "Verdict recorded": "評決が記録された",
+  "Graded against truth": "正解と照合して採点",
+  "record": "レコード",
+  /* focus + counters */
+  "all events": "全イベント",
+  "steps": "ステップ",
+  "step": "ステップ",
+  /* provenance */
+  "chain verified": "チェーン検証済み",
+  "events": "イベント",
+  "events recorded": "イベントを記録",
+  "FAILED at": "失敗ノード:",
+  "CHAIN BROKEN — this replay does not match the run that produced it":
+    "チェーン破損 — このリプレイは元の実行と一致しない",
+  "No run loaded.": "実行が未読み込み。",
+  "This is the template.": "これはテンプレートです。",
+  "to fill it from a real run in runs.db.": "で runs.db の実行を読み込めます。",
+  /* results table */
+  "Root cause": "根本原因",
+  "Proposed fix": "提案された修正",
+  "Confidence": "確信度",
+  "Axis": "評価軸",
+  "What the pipeline said": "パイプラインの回答",
+  "Ground truth": "正解",
+  "Judge": "ジャッジ",
+  "Nothing was triaged in this run — no verdict to compare.":
+    "この実行では何もトリアージされていない — 比較する評決がない。",
+  /* chrome */
+  "Harness": "ハーネス",
+  "Mode": "モード",
+  "Error": "エラー",
+  "Distractors / seed": "デコイ / シード",
+  "Pristine": "クリーン対照",
+  "Switch nodes off for this run": "この実行で無効化するノード",
+  "Watching": "表示中の実行",
+  "Showing": "表示対象",
+  "Start run": "実行開始",
+  "Starting…": "開始中…",
+  "Delete": "削除",
+  "Sure?": "本当に？",
+  "◀ Back": "◀ 戻る",
+  "Next ▶": "次へ ▶",
+  "▶ Play": "▶ 再生",
+  "❚❚ Pause": "❚❚ 一時停止",
+  "Restart": "最初から",
+  "What is happening": "いま何が起きているか",
+  "Who is on the map": "マップ上の登場者",
+  "Verdict against ground truth": "評決と正解の照合",
+  "Ground truth · withheld from the pipeline, shown only to the judge":
+    "正解（ground truth）· パイプラインには隠され、ジャッジだけが見る",
+  /* legend */
+  "The error log": "エラーログ",
+  "travels the spine, one record": "背骨のラインを 1 レコードずつ進む",
+  "The agent": "エージェント",
+  "goes out for evidence, comes back": "証拠を取りに出て、戻ってくる",
+  "Retrieved data": "取得データ",
+  "returns along the wire it was asked over": "要求した配線を通って返ってくる",
+  /* box subtitles (titles are code names and stay) */
+  "level filter": "レベルフィルタ",
+  "scrub + md5 identity": "正規化 + md5 識別子",
+  "counts / threshold": "カウント / 閾値",
+  "one pick, one call": "1 選択 = 1 呼び出し",
+  "push mode": "push モード",
+  "agentic mode": "agentic モード",
+  "submit + validate": "提出 + 検証",
+  "grade vs truth": "正解と照合",
+  "what came in": "入力ログの保管庫",
+  "source code": "ソースコード",
+  "ground truth": "正解データ",
+  "every step above lands here, hash-linked": "全ステップがハッシュ連結でここに記録される",
+};
+
+/* Whole-string lookup: English in, Japanese out, English through.
+   Named L, not t: four scopes in this file bind a local `t`, and a shadowed
+   translator would fail silently rather than loudly. */
+const TXT = s => (LANG === "ja" && JA[s]) || s;
+
+/* Known English fragments inside data that arrives from the run itself
+   (export-baked results rows, store labels). Substring replacement, so model
+   text — which matches nothing — passes through untouched. */
+const JA_SUB = {
+  "not graded in this run": "この実行では未採点",
+  "Judged on whether it removes the defect, not whether it sounds right":
+    "もっともらしさではなく、欠陥を取り除くかどうかで判定",
+  "escalated to a human": "人間へエスカレーション",
+  "cleared 0.8, routed without waking anyone": "0.8 を超過、誰も起こさずルーティング",
+  "No grade recorded yet in this run.": "この実行にはまだ採点が記録されていない。",
+  "Ground truth reaches nothing before the judge.": "正解はジャッジより前には届かない。",
+  "This run recorded no grade, so no ground truth was compared.":
+    "この実行は採点を記録していないため、正解との比較はない。",
+  "Ground truth lives in TRUTH[fingerprint] and reaches nothing before the judge.":
+    "正解は TRUTH[fingerprint] にあり、ジャッジより前には何にも届かない。",
+  "not triaged": "未トリアージ",
+  "No run loaded yet — pick one under Watching, or press Start run.":
+    "実行が未読み込み — 「表示中の実行」から選ぶか「実行開始」を押してください。",
+};
+const tSub = s => LANG === "ja" && typeof s === "string"
+  ? Object.entries(JA_SUB).reduce((a, [en, ja]) => a.split(en).join(ja), s) : s;
+
+/* ============================================================
    Derive the replay from the chain. One step per recorded event,
    in the order they were written — nothing invented here.
    ============================================================ */
@@ -383,6 +505,21 @@ const HUMAN = {
   "triage.route":       ["Routing", "Above 0.8 the fix is attached and the channel is quiet; below it, an engineer is named."],
   "triage.judge":       ["The judge", "Ground truth enters here and nowhere earlier. Cause and fix are scored independently."],
 };
+
+/* Japanese node explanations. Keyed the same; any node missing here simply
+   keeps its English pair. Node names themselves stay English on the map. */
+const HUMAN_JA = {
+  "ingest.gate":        ["レベルゲート", "ERROR 未満はここで止まる。INFO 行はコンテキストとしてバッファに残るが、トリアージ候補にはならず、リクエストも消費しない。"],
+  "ingest.fingerprint": ["フィンガープリント", "タイムスタンプ・UUID・連続する数字を除去し、サービス名・エラークラス・正規化済みメッセージを一つの識別子にまとめる。これを共有するエラーは同じバグとみなす。"],
+  "ingest.count":       ["カウントと閾値", "シグネチャを数え、最初のレコードを標本として保持する。閾値を超えたものだけが、リクエストを費やす価値を持つ。"],
+  "triage.select":      ["オペレーターが選ぶ", "自動では何もトリアージしない。人間がシグネチャを選び、その 1 選択が 1 日 20 回のうちの 1 リクエストになる。"],
+  "triage.context":     ["push モード：コンテキストは事前に用意", "パケットは呼び出しの前に組み立てられる。そこに入っていないものを、モデルは要求できない。"],
+  "triage.investigate": ["agentic モード：自分で証拠を取りに行く", "読み取り専用ツール 4 つと呼び出し予算。すべての呼び出しと、返ってきた結果が下に記録される。"],
+  "triage.verdict":     ["評決", "tools と response_schema は併用できないため、評決はツール呼び出しとして届く。ここで Pydantic が検証し、needs_human_review は信用せず再計算する。"],
+  "triage.route":       ["ルーティング", "確信度 0.8 以上なら修正案を添えて静かなチャンネルへ。未満ならエンジニアを名指しでエスカレーションする。"],
+  "triage.judge":       ["ジャッジ", "正解（ground truth）はここで初めて登場する。原因と修正は別々に採点される。"],
+};
+if (LANG === "ja") Object.assign(HUMAN, HUMAN_JA);
 
 /* Attribution is per walk, not per event. A walk runs from an ingest.gate enter
    to its exit or halt; the ingest.fingerprint exit inside it names the signature
@@ -413,22 +550,23 @@ function deriveSteps(run) {
     let head = title, note = blurb, agent = null, data = [];
 
     if (e.kind === "enter") continue;              // exit carries the outcome
-    if (e.kind === "skip") { head = title + " — skipped"; note = "This path was not taken: " + (p.why || ""); }
-    if (e.kind === "error") { head = title + " — failed"; note = `${p.type}: ${p.message}`; }
+    if (e.kind === "skip") { head = title + TXT(" — skipped"); note = TXT("This path was not taken: ") + TXT(p.why || ""); }
+    if (e.kind === "error") { head = title + TXT(" — failed"); note = `${p.type}: ${p.message}`; }
     if (e.kind === "exit" && p.halted) {
-      head = `${p.level || "record"} turned away at the gate`;
-      note = `${p.service || "?"} · ${p.message || ""} — kept as context, never triaged.`;
+      head = `${p.level || TXT("record")} ${TXT("turned away at the gate")}`;
+      note = `${p.service || "?"} · ${p.message || ""} — ${TXT("kept as context, never triaged.")}`;
     }
     if (e.kind === "tool") {
       const arg = (p.args && (p.args.path || p.args.pattern || p.args.query)) || "";
       head = `Tool · ${p.name}` + (arg ? ` — ${arg}` : "");
-      note = `${p.name}(${JSON.stringify(p.args || {}).slice(1, -1)}) — asked over stdio to the MCP server; nobody packed this into the prompt. The result is in the panel below.`;
+      note = `${p.name}(${JSON.stringify(p.args || {}).slice(1, -1)}) — `
+        + TXT("asked over stdio to the MCP server; nobody packed this into the prompt. The result is in the panel below.");
       agent = "mcp";
       data = [{l: p.name + (arg ? " · " + String(arg).split("/").pop() : ""),
                at: "triage.investigate"}];
     }
-    if (e.kind === "verdict") { head = "Verdict recorded"; note = p.root_cause || ""; }
-    if (e.kind === "grade")   { head = "Graded against truth"; note = p.reasoning || ""; }
+    if (e.kind === "verdict") { head = TXT("Verdict recorded"); note = p.root_cause || ""; }
+    if (e.kind === "grade")   { head = TXT("Graded against truth"); note = p.reasoning || ""; }
 
     out.push({
       seq: e.seq, node: e.node, kind: e.kind, at: nodeOf(e.node), h: head, n: note,
@@ -496,6 +634,30 @@ const DETAIL = Object.assign({
 }, Object.fromEntries(Object.keys(LAYOUT).filter(k => k.includes(".")).map(k =>
    [k, {t: (HUMAN[k] || [k])[0], s: k, p: (HUMAN[k] || ["", ""])[1], c: ""}])));
 
+/* Japanese drawer copy. Only `t` (title) and `p` (prose) are translated —
+   `s` is a code location and `c` is source, both of which stay as they are.
+   Anything absent here keeps its English text rather than going blank. */
+const DETAIL_JA = {
+ actor_log: {t:"ログレコード", p:"1 つの dict が、各ノードで形を変え注釈を足されていく。Python の例外として入り、チェーンに記録された採点済みの評決として出ていく。"},
+ actor_agent:{t:"エージェント", p:"チャットループではない。読み取り専用ツール 4 つ、調査呼び出しの予算、そして答える手段は 1 つだけ。submit_verdict を呼ばずに終われば、_fallback が作り話をせず人間にエスカレーションする。"},
+ actor_data:{t:"取得された証拠", p:"要求が出ていった配線をそのまま通って戻ってくる。エージェントがプロンプト以外に知っていることは、すべてこの経路で届いたもの。"},
+ runsdb:{t:"証拠チェーン", p:"各イベントは 1 つ前のハッシュを含むため、リプレイは信用するのではなく検証できる。verify() は最初に辻褄が合わなくなった行を指す。ペイロードの改ざんでも、行の削除でも、リンクは切れる。"},
+ logsdb:{t:"logs.db — 入力されたログ", p:"チェーンとは意図的に別のデータベース。一方はパイプラインが読む入力で、もう一方はパイプラインについての証言。レコードは run_id を持つので、以前の実行の行がこのエラーのものとして返ることはない。だから実行のたびに消去する必要もない。"},
+ mcp:{t:"MCP は意図的に薄いラッパー", p:"4 つのツールは mcp_tools.py の中の、MCP を import しないただの関数。だからパスの牢屋を含むツール一式が、サーバーもプロトコルも API キーもなしでテストできる。"},
+ source:{t:"targets/pyyaml — トレースバックの下にある実際のコード", p:"モデルが渡すパスはすべてパスの牢屋を通る。モデルはこれをトレースバックから拾うが、トレースバックにはマシン上のどこでも指せる絶対パスが載っている。"},
+ buffer:{t:"BUFFER — コンテキストの供給源", p:"すべてのレベルを保持する。push モードのコンテキストはここから作られる。エラーと同じ trace_id を持つ行と、そのサービスの直近の行。"},
+ app:{t:"障害は本物", p:"ログ文字列を手で書いているものは一つもない。実際の PyYAML クローンに変更を注入し、モジュールをディスクから再 import して、ライブラリを呼ぶ。例外もフレームも行番号も Python が生成したもの。"},
+ handler:{t:"1 レコード、2 つの行き先", p:"LogRecord をパイプラインの dict 形式に変換し、メモリ上のバッファと logs.db の両方へ書き、そのうえで ingest グラフを歩かせる。"},
+ api:{t:"評決はツール呼び出しとして届く", p:"tools と response_schema を同時に指定すると、宙ぶらりんの function_call が返り parsed は None になる — 実際の API を叩いて判明した。そこで submit_verdict がスキーマを担い、検証は Pydantic がこちら側で行う。"},
+ truth:{t:"隠された正解", p:"障害が発火した瞬間にシミュレーターが書き込む。ログにも、どのプロンプトにも入らない。システム内でこれを最初に読むのはジャッジである。"},
+};
+if (LANG === "ja") {
+  for (const k in DETAIL) {
+    const ja = DETAIL_JA[k] || (HUMAN_JA[k] ? {t: HUMAN_JA[k][0], p: HUMAN_JA[k][1]} : null);
+    if (ja) DETAIL[k] = {...DETAIL[k], ...ja};
+  }
+}
+
 /* ============================================================
    Build the map
    ============================================================ */
@@ -519,7 +681,7 @@ for (const id in LAYOUT) {
                       tabindex: "0", role: "button" });
   g.appendChild(mk("rect", { x: n.x - n.w/2, y: n.y - n.h/2, width: n.w, height: n.h }));
   const t1 = mk("text", { class:"t", x:n.x, y:n.y - 3, "text-anchor":"middle" }); t1.textContent = n.t;
-  const t2 = mk("text", { class:"s", x:n.x, y:n.y + 15, "text-anchor":"middle" }); t2.textContent = n.s;
+  const t2 = mk("text", { class:"s", x:n.x, y:n.y + 15, "text-anchor":"middle" }); t2.textContent = TXT(n.s);
   g.appendChild(t1); g.appendChild(t2);
   const open = () => openDrawer(id);
   g.addEventListener("click", open);
@@ -663,13 +825,13 @@ function buildFocusOptions() {
   const sigs = signatures();
   sel.innerHTML = "";
   const all = document.createElement("option");
-  all.value = ""; all.textContent = `all events (${ALL.length} steps)`;
+  all.value = ""; all.textContent = `${TXT("all events")} (${ALL.length} ${TXT("steps")})`;
   sel.appendChild(all);
   sigs.forEach(sg => {
     const o = document.createElement("option");
     o.value = sg.fp;
     const name = [sg.service, sg.cls].filter(Boolean).join(" ") || sg.fp.slice(0, 12);
-    o.textContent = `${name} — ${sg.n} steps`;
+    o.textContent = `${name} — ${sg.n} ${TXT("steps")}`;
     sel.appendChild(o);
   });
   /* Default to whatever was triaged: that is what the run was about. */
@@ -743,7 +905,7 @@ function paint(anim = true) {
     io.appendChild(dt); io.appendChild(dd);
   });
 
-  $("#count").textContent = `step ${step + 1} / ${STEPS.length}  ·  seq ${s.seq}`;
+  $("#count").textContent = `${TXT("step")} ${step + 1} / ${STEPS.length}  ·  seq ${s.seq}`;
   $("#prev").disabled = step === 0;
   $("#next").disabled = step === STEPS.length - 1;
   [...$("#scrub").children].forEach((b, i) =>
@@ -756,20 +918,20 @@ function paintResults() {
   if (!RESULTS.length) {
     const r = t.insertRow(); const c = r.insertCell();
     c.colSpan = 4;
-    c.textContent = "Nothing was triaged in this run — no verdict to compare.";
+    c.textContent = TXT("Nothing was triaged in this run — no verdict to compare.");
     c.style.color = "var(--dim)";
     return;
   }
   const h = t.insertRow();
   ["Axis", "What the pipeline said", "Ground truth", "Judge"].forEach(x => {
-    const th = document.createElement("th"); th.textContent = x; h.appendChild(th); });
+    const th = document.createElement("th"); th.textContent = TXT(x); h.appendChild(th); });
   RESULTS.forEach(r => {
     const tr = t.insertRow();
     const shown = STEPS[step] && STEPS[step].seq >= r.at;
     if (!shown) tr.className = "pending";
-    const a = tr.insertCell(); a.className = "axis"; a.textContent = r.axis;
-    tr.insertCell().textContent = shown ? r.got : "—";
-    tr.insertCell().textContent = shown ? r.truth : "—";
+    const a = tr.insertCell(); a.className = "axis"; a.textContent = TXT(r.axis);
+    tr.insertCell().textContent = shown ? tSub(r.got) : "—";
+    tr.insertCell().textContent = shown ? tSub(r.truth) : "—";
     const c = tr.insertCell();
     if (shown) {
       const p = document.createElement("span");
@@ -819,9 +981,9 @@ document.addEventListener("keydown", e => {
   if (e.key === "ArrowLeft") { stop(); go(step - 1); }
 });
 
-[["log","The error log","travels the spine, one record"],
- ["agent","The agent","goes out for evidence, comes back"],
- ["data","Retrieved data","returns along the wire it was asked over"]].forEach(([k, name, txt]) => {
+[["log", TXT("The error log"), TXT("travels the spine, one record")],
+ ["agent", TXT("The agent"), TXT("goes out for evidence, comes back")],
+ ["data", TXT("Retrieved data"), TXT("returns along the wire it was asked over")]].forEach(([k, name, txt]) => {
   const row = document.createElement("div"); row.className = "lg";
   const svg = mk("svg", { viewBox:"-20 -18 40 40", class:"sw" });
   svg.appendChild(k === "log" ? spriteLog() : k === "agent" ? spriteAgent() : spriteData());
@@ -835,12 +997,63 @@ document.addEventListener("keydown", e => {
    so the live page kept showing the template placeholder after a run loaded. */
 function renderTruth() {
 $("#t-loc").textContent = TRUTH.loc || "—";
-$("#t-cause").textContent = TRUTH.cause || "";
-$("#t-hid").textContent = TRUTH.hid || "";
+$("#t-cause").textContent = tSub(TRUTH.cause || "");
+$("#t-hid").textContent = tSub(TRUTH.hid || "");
 $("#t-diff").innerHTML = TRUTH.was
   ? `<s>${TRUTH.was}</s> &nbsp;→&nbsp; <b>${TRUTH.now}</b>` : "";
 }
 renderTruth();
+
+/* ============================================================
+   Static chrome. Assigned by selector rather than by scanning text, so a
+   translation can never touch a value, a code name or run data by accident.
+   Runs for the exported page too — both share this template.
+   ============================================================ */
+function applyChrome() {
+  const label = (sel, s) => {   // the label's own text node, not its controls
+    const el = $(sel); if (!el) return;
+    for (const n of el.childNodes)
+      if (n.nodeType === 3 && n.textContent.trim()) { n.textContent = TXT(s); return; }
+  };
+  const btn = (sel, s) => { const el = $(sel); if (el) el.textContent = TXT(s); };
+
+  document.querySelectorAll(".ctl > label").forEach(el => {
+    for (const n of el.childNodes) {
+      if (n.nodeType === 3 && n.textContent.trim()) {
+        n.textContent = TXT(n.textContent.trim());
+        break;
+      }
+    }
+  });
+  label(".focuswrap", "Showing");
+  btn("#prev", "◀ Back"); btn("#next", "Next ▶");
+  btn("#play", "▶ Play"); btn("#reset", "Restart");
+  btn("#c-start", "Start run"); btn("#c-del", "Delete");
+  const heads = document.querySelectorAll(".read h3, .results h3");
+  if (heads[0]) heads[0].textContent = TXT("What is happening");
+  if (heads[1]) heads[1].textContent = TXT("Who is on the map");
+  if (heads[2]) heads[2].textContent = TXT("Verdict against ground truth");
+  const lab = document.querySelector(".truth .lab");
+  if (lab) lab.textContent =
+    TXT("Ground truth · withheld from the pipeline, shown only to the judge");
+  document.documentElement.lang = LANG;
+}
+applyChrome();
+
+/* The toggle reloads rather than re-rendering: one rendering path means a
+   translation bug cannot produce a half-translated live view, and the page is
+   cheap to rebuild. Exported pages carry this too — the run data is inlined. */
+{
+  const lb = $("#c-lang");
+  if (lb) {
+    lb.textContent = LANG === "ja" ? "English" : "日本語";
+    lb.onclick = () => {
+      try { localStorage.setItem("triage-lang", LANG === "ja" ? "en" : "ja"); }
+      catch (e) { /* private mode: the toggle is cosmetic, never fatal */ }
+      location.reload();
+    };
+  }
+}
 
 /* The provenance line: which run this is, and whether it can be trusted. */
 if (RUN) {
@@ -848,22 +1061,22 @@ if (RUN) {
   const failed = ALL.find(st => st.failed);
   bar.className = "prov" + (!RUN.intact ? " broken" : failed ? " failbar" : "");
   if (!RUN.intact) {
-    bar.textContent = `run ${RUN.run_id} · CHAIN BROKEN — this replay does not match `
-      + `the run that produced it`;
+    bar.textContent = `run ${RUN.run_id} · `
+      + TXT("CHAIN BROKEN — this replay does not match the run that produced it");
   } else if (failed) {
     // A run that died mid-way must not read as a short but complete one.
     const io = Object.fromEntries(failed.io || []);
-    bar.textContent = `run ${RUN.run_id} · FAILED at ${failed.node} — `
-      + `${io.type || ""}: ${io.message || ""} · ${RUN.events.length} events recorded`;
+    bar.textContent = `run ${RUN.run_id} · ${TXT("FAILED at")} ${failed.node} — `
+      + `${io.type || ""}: ${io.message || ""} · ${RUN.events.length} ${TXT("events recorded")}`;
   } else {
-    bar.textContent = `run ${RUN.run_id} · ${RUN.mode} · ${RUN.events.length} events`
-      + ` · chain verified`;
+    bar.textContent = `run ${RUN.run_id} · ${RUN.mode} · ${RUN.events.length} ${TXT("events")}`
+      + ` · ${TXT("chain verified")}`;
   }
   $("#chrome-prov").appendChild(bar);
 } else {
-  $("#now").innerHTML = "<b>No run loaded.</b> This is the template. "
-    + "Run <code>python run.py export --run &lt;id&gt;</code> to fill it "
-    + "from a real run in runs.db.";
+  $("#now").innerHTML = `<b>${TXT("No run loaded.")}</b> ${TXT("This is the template.")} `
+    + `<code>python run.py export --run &lt;id&gt;</code> `
+    + TXT("to fill it from a real run in runs.db.");
 }
 
 go(0, false);
@@ -938,7 +1151,7 @@ async function loadRuns(select) {
     const off = ((r.condition || {}).disabled || []).length;
     const hz = (r.condition || {}).harness || "?";
     const t = r.run_id.slice(9, 11) + ":" + r.run_id.slice(11, 13) + ":" + r.run_id.slice(13, 15);
-    o.textContent = `${t} · ${hz} · ${r.label || "?"} · ${r.mode}`
+    o.textContent = `${t} · ${hz} · ${tSub(r.label || "?")} · ${r.mode}`
       + (off ? ` · ${off} off` : "") + (r.status && r.status.startsWith("failed") ? " · FAILED" : "")
       + (r.live ? " · ●live" : "");
     sel.appendChild(o);
@@ -988,7 +1201,7 @@ async function poll() {
 }
 
 async function startRun() {
-  const btn = $("#c-start"); btn.disabled = true; btn.textContent = "Starting…";
+  const btn = $("#c-start"); btn.disabled = true; btn.textContent = TXT("Starting…");
   try {
     const disable = [...document.querySelectorAll("#c-nodes input:checked")]
       .map(i => i.value);
@@ -1017,7 +1230,7 @@ async function startRun() {
   } catch (e) {
     alert("could not start: " + e.message);
   } finally {
-    btn.disabled = false; btn.textContent = "Start run";
+    btn.disabled = false; btn.textContent = TXT("Start run");
   }
 }
 
@@ -1062,8 +1275,8 @@ if (LIVE) {
     if (!rid) return;
     if (Date.now() - delArmed > 2500) {
       delArmed = Date.now();
-      b.textContent = "Sure?";
-      setTimeout(() => { b.textContent = "Delete"; }, 2500);
+      b.textContent = TXT("Sure?");
+      setTimeout(() => { b.textContent = TXT("Delete"); }, 2500);
       return;
     }
     b.disabled = true;
@@ -1077,10 +1290,10 @@ if (LIVE) {
       await loadRuns();               // falls through to watching the latest
     } catch (e) {
       b.textContent = "✗ " + e.message.slice(0, 30);
-      setTimeout(() => { b.textContent = "Delete"; }, 3000);
+      setTimeout(() => { b.textContent = TXT("Delete"); }, 3000);
     } finally {
       b.disabled = false; delArmed = 0;
-      if (b.textContent === "Sure?") b.textContent = "Delete";
+      if (b.textContent === TXT("Sure?")) b.textContent = TXT("Delete");
     }
   };
   $("#c-harness").onchange = e => {

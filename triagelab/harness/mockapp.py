@@ -19,6 +19,7 @@ Run:  python mockapp.py
 import itertools
 import json
 import logging
+import os
 import sys
 import urllib.request
 from collections import deque
@@ -276,6 +277,12 @@ class EvalPipeline(triage.TriagePipeline):
             "Grade the two independently: a correct diagnosis with a wrong fix is a real "
             "and common outcome, and must score high on one and low on the other."
         )
+        if os.getenv("TRIAGE_LANG", "") == "ja":
+            # The diagnosis arrives in Japanese; the ground truth stays English.
+            # Grading is cross-language on purpose — truth is authored once.
+            prompt += ("\n\nThe DIAGNOSIS and FIX may be written in Japanese. "
+                       "Grade the substance regardless of language, and write "
+                       "`reasoning` in Japanese (日本語).")
         try:
             resp = self.client.models.generate_content(
                 model=triage.MODEL,

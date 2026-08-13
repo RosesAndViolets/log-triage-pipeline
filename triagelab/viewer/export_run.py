@@ -187,6 +187,28 @@ def _self_check():
         out = export("x1", tmp / "m.html")
         html = out.read_text(encoding="utf-8")
         assert MARKER not in html, "marker survived — the run was not inlined"
+
+        # --- the template's own invariants -------------------------------
+        # A duplicate top-level `const` is a SyntaxError that blanks the whole
+        # page, and no Python check would see it. This caught a real collision:
+        # the translator was briefly named L, which the LAYOUT accessor owns.
+        import collections
+        import re as _re
+        script = html.split("<script>")[-1]
+        names = _re.findall(r"^const ([A-Za-z_$][\w$]*)\s*=", script, _re.M)
+        dupes = [n for n, c in collections.Counter(names).items() if c > 1]
+        assert not dupes, f"duplicate top-level const in map_template.html: {dupes}"
+
+        # The language layer must fall back, never blank: English is the
+        # default, and every translation value has to be a non-empty string.
+        assert 'const LANG' in script and 'const TXT' in script
+        for tbl, least in (("JA", 40), ("JA_SUB", 5)):
+            body = script.split(f"const {tbl} = {{", 1)[1].split("\n};", 1)[0]
+            vals = _re.findall(r':\s*"((?:[^"\\]|\\.)*)"', body)
+            assert len(vals) >= least, f"{tbl} looks empty: {len(vals)} entries"
+            assert all(v.strip() for v in vals), f"{tbl} has a blank translation"
+        # Japanese must actually be present, and English must remain the default.
+        assert "日本語" in script and 'localStorage.getItem("triage-lang") || "en"' in script
         assert '"run_id": "x1"' in html or '"run_id":"x1"' in html
         assert "</script>" not in html.split("RUN = ")[1][:4000], \
             "payload could close the script block early"

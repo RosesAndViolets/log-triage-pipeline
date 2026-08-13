@@ -21,6 +21,21 @@ MODEL = os.getenv("TRIAGE_MODEL", "gemini-3.1-flash-lite")
 # the rest. On a paid key: TRIAGE_RPM_SLEEP=0. Quota limits live in env vars,
 # never in code, so the work machine lifts them without an edit.
 RPM_SLEEP = float(os.getenv("TRIAGE_RPM_SLEEP", "4"))
+
+
+def lang_note() -> str:
+    """Prompt suffix that makes the model answer in Japanese, or nothing.
+
+    Read per call, not at import, so tests can toggle it. Unset, every prompt
+    is byte-identical to before this existed — the display language is a
+    property of the run that produced the text, never a rewrite of it.
+    """
+    if os.getenv("TRIAGE_LANG", "") == "ja":
+        return ("\n\nIMPORTANT: Write root_cause, proposed_fix and every "
+                "free-text field in Japanese (日本語). Keep code identifiers, "
+                "file paths, class names and error classes exactly as they "
+                "appear in the code.")
+    return ""
 # Each tool round-trip is its own API request, so this is a budget, not a timeout.
 AGENTIC_TOOL_BUDGET = int(os.getenv("TRIAGE_TOOL_BUDGET", "4"))
 
@@ -222,7 +237,7 @@ class TriagePipeline:
             f"class: {log['error']['class']}\n"
             f"message: {log['message']}\n"
             f"stack: {log['error'].get('stack', 'n/a')}\n"
-        )
+        ) + lang_note()
         context = self._fetch_context(log)
         if context:
             prompt += f"\nrelated log lines leading up to the error:\n{context}\n"
@@ -266,6 +281,7 @@ class TriagePipeline:
             "Investigate before concluding. Read the code at the deepest frame that is not "
             "standard library. When you know what is wrong, call submit_verdict exactly once. "
             "Do not answer in prose — the verdict only counts if it arrives through the tool."
+            + lang_note()
         )
 
     def triage_agentic(self, log: dict, count: int) -> TriageVerdict:
@@ -512,6 +528,18 @@ def _self_check():
     assert p.chain is None and p.run_id == ""
     p.bind("r1", object())
     assert p.run_id == "r1" and p.chain is not None
+
+    # TRIAGE_LANG unset must leave every prompt byte-identical: the language
+    # switch is additive or absent, never a rewrite.
+    assert lang_note() == "", lang_note()
+    os.environ["TRIAGE_LANG"] = "ja"
+    try:
+        assert "日本語" in lang_note()
+        assert "日本語" in p._agentic_prompt(
+            {"serviceName": "s", "message": "m", "error": {"class": "E"}}, 1)
+    finally:
+        del os.environ["TRIAGE_LANG"]
+    assert lang_note() == ""
 
     # Tool results must be recorded as their text, not as an object repr —
     # the replay's "what did read_source actually read" panel depends on it.
